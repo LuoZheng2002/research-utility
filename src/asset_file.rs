@@ -7,7 +7,8 @@ pub trait AssetFile {
     /// - Synchronize all dependency assets first by calling their `synchronize()` methods.
     /// - Decide whether current output is stale:
     ///   - tracking file missing;
-    ///   - target file missing while tracking exists (panic/assert);
+    ///   - target file missing while tracking exists;
+    ///   - tracking file schema version exists and does not match current schema version;
     ///   - dependency hash mismatch versus tracking.
     /// - Regenerate output only when stale:
     ///   - call dependency `fetch()` only in the regeneration path;
