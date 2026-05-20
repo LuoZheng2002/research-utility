@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from sqlite_payload_jsonl import (
+from .sqlite_payload_jsonl import (
     export_sqlite_payload_table_to_jsonl,
     resolve_output_path,
 )

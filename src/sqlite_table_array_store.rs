@@ -36,7 +36,7 @@ impl SqliteTableArrayKey for &str {
 /// Semantics:
 /// - `table_key` is the hashmap key.
 /// - Each key maps to one physical SQLite table.
-/// - Each table stores an ordered array of JSON payload rows.
+/// - Each table stores an ordered array of MessagePack payload rows.
 ///
 /// Operational properties:
 /// - `append(table_key, value)` appends to that key's array in O(1) amortized time.
@@ -82,7 +82,7 @@ where
     pub fn append(&self, table_key: K, value: &V) -> Result<(), String> {
         let table_name = Self::table_name(table_key.to_table_key_text());
         self.initialize_table(&table_name)?;
-        let payload_json = serde_json::to_string(value).map_err(|e| {
+        let payload_msgpack = rmp_serde::to_vec_named(value).map_err(|e| {
             format!(
                 "Failed to serialize sqlite payload for table {} in {}: {}",
                 table_name,
@@ -94,12 +94,12 @@ where
             .execute(
                 &format!(
                     "
-                    INSERT INTO {} (payload_json)
+                    INSERT INTO {} (payload_msgpack)
                     VALUES (?1)
                     ",
                     table_name
                 ),
-                params![payload_json],
+                params![payload_msgpack],
             )
             .map_err(|e| {
                 format!(
@@ -121,7 +121,7 @@ where
             .connection
             .prepare(&format!(
                 "
-                SELECT payload_json
+                SELECT payload_msgpack
                 FROM {}
                 ORDER BY id ASC
                 ",
@@ -201,7 +201,7 @@ where
                 "
                 CREATE TABLE IF NOT EXISTS {} (
                     id INTEGER PRIMARY KEY,
-                    payload_json TEXT NOT NULL
+                    payload_msgpack BLOB NOT NULL
                 );
                 ",
                 table_name
@@ -246,9 +246,9 @@ fn decode_payload_row<V>(row: &Row<'_>) -> rusqlite::Result<V>
 where
     V: DeserializeOwned,
 {
-    let payload_json: String = row.get(0)?;
-    serde_json::from_str(&payload_json).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    let payload_msgpack: Vec<u8> = row.get(0)?;
+    rmp_serde::from_slice(&payload_msgpack).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(e))
     })
 }
 

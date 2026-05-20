@@ -1,0 +1,3 @@
+[console_scripts]
+research-sqlite-to-jsonl = research_utility.sqlite_to_jsonl:main
+research-sqlite-to-jsonl-all = research_utility.sqlite_to_jsonl_all:main

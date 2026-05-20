@@ -80,7 +80,7 @@ where
                 "
                 CREATE TABLE IF NOT EXISTS {} (
                     id TEXT PRIMARY KEY,
-                    payload_json TEXT NOT NULL
+                    payload_msgpack BLOB NOT NULL
                 );
                 ",
                 SQLITE_STORE_TABLE_NAME
@@ -114,7 +114,7 @@ where
     pub fn upsert(&self, key: K, value: &V) -> Result<(), String> {
         self.initialize_schema()?;
         let key_text = key.to_key_text();
-        let payload_json = serde_json::to_string(value).map_err(|e| {
+        let payload_msgpack = rmp_serde::to_vec_named(value).map_err(|e| {
             format!(
                 "Failed to serialize sqlite payload for table {} in {}: {}",
                 SQLITE_STORE_TABLE_NAME,
@@ -126,13 +126,13 @@ where
             .execute(
                 &format!(
                     "
-                    INSERT INTO {} (id, payload_json)
+                    INSERT INTO {} (id, payload_msgpack)
                     VALUES (?1, ?2)
-                    ON CONFLICT(id) DO UPDATE SET payload_json = excluded.payload_json
+                    ON CONFLICT(id) DO UPDATE SET payload_msgpack = excluded.payload_msgpack
                     ",
                     SQLITE_STORE_TABLE_NAME
                 ),
-                params![key_text, payload_json],
+                params![key_text, payload_msgpack],
             )
             .map_err(|e| {
                 format!(
@@ -149,11 +149,11 @@ where
     pub fn get(&self, key: K) -> Result<Option<V>, String> {
         self.initialize_schema()?;
         let key_text = key.to_key_text();
-        let payload: Option<String> = self
+        let payload: Option<Vec<u8>> = self
             .connection
             .query_row(
                 &format!(
-                    "SELECT payload_json FROM {} WHERE id = ?1",
+                    "SELECT payload_msgpack FROM {} WHERE id = ?1",
                     SQLITE_STORE_TABLE_NAME
                 ),
                 params![key_text],
@@ -170,8 +170,8 @@ where
                 )
             })?;
         payload
-            .map(|json| {
-                serde_json::from_str::<V>(&json).map_err(|e| {
+            .map(|msgpack| {
+                rmp_serde::from_slice::<V>(&msgpack).map_err(|e| {
                     format!(
                         "Failed to deserialize sqlite payload for key {} from table {} at {}: {}",
                         key.to_key_text(),
@@ -190,7 +190,7 @@ where
             .connection
             .prepare(&format!(
                 "
-                SELECT payload_json
+                SELECT payload_msgpack
                 FROM {}
                 ORDER BY id ASC
                 ",
@@ -263,8 +263,8 @@ fn decode_payload_row<V>(row: &Row<'_>) -> rusqlite::Result<V>
 where
     V: DeserializeOwned,
 {
-    let payload_json: String = row.get(0)?;
-    serde_json::from_str(&payload_json).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    let payload_msgpack: Vec<u8> = row.get(0)?;
+    rmp_serde::from_slice(&payload_msgpack).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(e))
     })
 }

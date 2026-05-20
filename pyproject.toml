@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "research-utility"
+version = "0.1.0"
+description = "SQLite-backed research utility helpers"
+requires-python = ">=3.10"
+dependencies = [
+    "msgpack>=1.0.7",
+]
+
+[project.scripts]
+research-sqlite-to-jsonl = "research_utility.sqlite_to_jsonl:main"
+research-sqlite-to-jsonl-all = "research_utility.sqlite_to_jsonl_all:main"
+
+[tool.setuptools]
+package-dir = {"" = "src_py"}
+
+[tool.setuptools.packages.find]
+where = ["src_py"]
+include = ["research_utility*"]
