@@ -1,5 +1,5 @@
-use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Serialize, de::DeserializeOwned};
+use sqlx::{Row, SqlitePool, sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions};
 use std::{marker::PhantomData, path::PathBuf};
 
 pub trait SqliteTableArrayKey {
@@ -30,7 +30,7 @@ impl SqliteTableArrayKey for &str {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 /// A persistent hashmap-of-ordered-arrays abstraction on top of SQLite.
 ///
 /// Semantics:
@@ -48,7 +48,7 @@ impl SqliteTableArrayKey for &str {
 /// - This keeps table names deterministic and SQL-identifier-safe.
 pub struct SqliteTableArrayStore<K, V> {
     db_path: PathBuf,
-    connection: Connection,
+    pool: SqlitePool,
     key_marker: PhantomData<K>,
     value_marker: PhantomData<V>,
 }
@@ -58,7 +58,7 @@ where
     K: SqliteTableArrayKey,
     V: Serialize + DeserializeOwned,
 {
-    pub fn new(db_path: impl Into<PathBuf>) -> Result<Self, String> {
+    pub async fn new(db_path: impl Into<PathBuf>) -> Result<Self, String> {
         let db_path = db_path.into();
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -69,19 +69,27 @@ where
                 )
             })?;
         }
-        let connection = Connection::open(&db_path)
+
+        let connect_options = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(connect_options)
+            .await
             .map_err(|e| format!("Failed to open sqlite database {}: {}", db_path.display(), e))?;
+
         Ok(Self {
             db_path,
-            connection,
+            pool,
             key_marker: PhantomData,
             value_marker: PhantomData,
         })
     }
 
-    pub fn append(&self, table_key: K, value: &V) -> Result<(), String> {
+    pub async fn append(&self, table_key: K, value: &V) -> Result<(), String> {
         let table_name = Self::table_name(table_key.to_table_key_text());
-        self.initialize_table(&table_name)?;
+        self.initialize_table(&table_name).await?;
         let payload_msgpack = rmp_serde::to_vec_named(value).map_err(|e| {
             format!(
                 "Failed to serialize sqlite payload for table {} in {}: {}",
@@ -90,52 +98,44 @@ where
                 e
             )
         })?;
-        self.connection
-            .execute(
-                &format!(
-                    "
-                    INSERT INTO {} (payload_msgpack)
-                    VALUES (?1)
-                    ",
-                    table_name
-                ),
-                params![payload_msgpack],
+        sqlx::query(&format!(
+            "
+            INSERT INTO {} (payload_msgpack)
+            VALUES (?1)
+            ",
+            table_name
+        ))
+        .bind(payload_msgpack)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            format!(
+                "Failed to append sqlite payload into table {} at {}: {}",
+                table_name,
+                self.db_path.display(),
+                e
             )
-            .map_err(|e| {
-                format!(
-                    "Failed to append sqlite payload into table {} at {}: {}",
-                    table_name,
-                    self.db_path.display(),
-                    e
-                )
-            })?;
+        })?;
         Ok(())
     }
 
-    pub fn load_table(&self, table_key: K) -> Result<Vec<V>, String> {
+    pub async fn load_table(&self, table_key: K) -> Result<Vec<V>, String> {
         let table_name = Self::table_name(table_key.to_table_key_text());
-        if !self.table_exists_with_name(&table_name)? {
+        if !self.table_exists_with_name(&table_name).await? {
             return Ok(Vec::new());
         }
-        let mut statement = self
-            .connection
-            .prepare(&format!(
-                "
-                SELECT payload_msgpack
-                FROM {}
-                ORDER BY id ASC
-                ",
-                table_name
-            ))
-            .map_err(|e| {
-                format!(
-                    "Failed to prepare ordered scan statement for table {} in {}: {}",
-                    table_name,
-                    self.db_path.display(),
-                    e
-                )
-            })?;
-        let rows = statement.query_map([], decode_payload_row::<V>).map_err(|e| {
+
+        let rows = sqlx::query(&format!(
+            "
+            SELECT payload_msgpack
+            FROM {}
+            ORDER BY id ASC
+            ",
+            table_name
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| {
             format!(
                 "Failed to execute ordered scan query for table {} in {}: {}",
                 table_name,
@@ -143,27 +143,37 @@ where
                 e
             )
         })?;
-        let mut values = Vec::new();
-        for row in rows {
-            values.push(row.map_err(|e| {
-                format!(
-                    "Failed to read row from table {} in {}: {}",
-                    table_name,
-                    self.db_path.display(),
-                    e
-                )
-            })?);
-        }
-        Ok(values)
+
+        rows.into_iter()
+            .map(|row| {
+                let payload_msgpack: Vec<u8> = row.try_get(0).map_err(|e| {
+                    format!(
+                        "Failed to decode row payload for table {} in {}: {}",
+                        table_name,
+                        self.db_path.display(),
+                        e
+                    )
+                })?;
+                rmp_serde::from_slice(&payload_msgpack).map_err(|e| {
+                    format!(
+                        "Failed to deserialize row payload for table {} in {}: {}",
+                        table_name,
+                        self.db_path.display(),
+                        e
+                    )
+                })
+            })
+            .collect()
     }
 
-    pub fn clear_table(&self, table_key: K) -> Result<(), String> {
+    pub async fn clear_table(&self, table_key: K) -> Result<(), String> {
         let table_name = Self::table_name(table_key.to_table_key_text());
-        if !self.table_exists_with_name(&table_name)? {
+        if !self.table_exists_with_name(&table_name).await? {
             return Ok(());
         }
-        self.connection
-            .execute(&format!("DELETE FROM {}", table_name), [])
+        sqlx::query(&format!("DELETE FROM {}", table_name))
+            .execute(&self.pool)
+            .await
             .map_err(|e| {
                 format!(
                     "Failed to clear table {} in {}: {}",
@@ -175,10 +185,11 @@ where
         Ok(())
     }
 
-    pub fn drop_table(&self, table_key: K) -> Result<(), String> {
+    pub async fn drop_table(&self, table_key: K) -> Result<(), String> {
         let table_name = Self::table_name(table_key.to_table_key_text());
-        self.connection
-            .execute(&format!("DROP TABLE IF EXISTS {}", table_name), [])
+        sqlx::query(&format!("DROP TABLE IF EXISTS {}", table_name))
+            .execute(&self.pool)
+            .await
             .map_err(|e| {
                 format!(
                     "Failed to drop table {} in {}: {}",
@@ -190,66 +201,55 @@ where
         Ok(())
     }
 
-    pub fn table_exists(&self, table_key: K) -> Result<bool, String> {
+    pub async fn table_exists(&self, table_key: K) -> Result<bool, String> {
         let table_name = Self::table_name(table_key.to_table_key_text());
-        self.table_exists_with_name(&table_name)
+        self.table_exists_with_name(&table_name).await
     }
 
-    fn initialize_table(&self, table_name: &str) -> Result<(), String> {
-        self.connection
-            .execute_batch(&format!(
-                "
-                CREATE TABLE IF NOT EXISTS {} (
-                    id INTEGER PRIMARY KEY,
-                    payload_msgpack BLOB NOT NULL
-                );
-                ",
-                table_name
-            ))
-            .map_err(|e| {
-                format!(
-                    "Failed to initialize table {} in {}: {}",
-                    table_name,
-                    self.db_path.display(),
-                    e
-                )
-            })?;
+    async fn initialize_table(&self, table_name: &str) -> Result<(), String> {
+        sqlx::query(&format!(
+            "
+            CREATE TABLE IF NOT EXISTS {} (
+                id INTEGER PRIMARY KEY,
+                payload_msgpack BLOB NOT NULL
+            )
+            ",
+            table_name
+        ))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            format!(
+                "Failed to initialize table {} in {}: {}",
+                table_name,
+                self.db_path.display(),
+                e
+            )
+        })?;
         Ok(())
     }
 
-    fn table_exists_with_name(&self, table_name: &str) -> Result<bool, String> {
-        let existing_table_name: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                params![table_name],
-                |row| row.get(0),
+    async fn table_exists_with_name(&self, table_name: &str) -> Result<bool, String> {
+        let existing_table_name: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        )
+        .bind(table_name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| {
+            format!(
+                "Failed to query sqlite_master for table {} in {}: {}",
+                table_name,
+                self.db_path.display(),
+                e
             )
-            .optional()
-            .map_err(|e| {
-                format!(
-                    "Failed to query sqlite_master for table {} in {}: {}",
-                    table_name,
-                    self.db_path.display(),
-                    e
-                )
-            })?;
+        })?;
         Ok(existing_table_name.is_some())
     }
 
     fn table_name(table_key_text: String) -> String {
         format!("table_{}", hex_encode(table_key_text.as_bytes()))
     }
-}
-
-fn decode_payload_row<V>(row: &Row<'_>) -> rusqlite::Result<V>
-where
-    V: DeserializeOwned,
-{
-    let payload_msgpack: Vec<u8> = row.get(0)?;
-    rmp_serde::from_slice(&payload_msgpack).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(e))
-    })
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
