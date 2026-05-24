@@ -77,7 +77,13 @@ where
             .max_connections(1)
             .connect_with(connect_options)
             .await
-            .map_err(|e| format!("Failed to open sqlite database {}: {}", db_path.display(), e))?;
+            .map_err(|e| {
+                format!(
+                    "Failed to open sqlite database {}: {}",
+                    db_path.display(),
+                    e
+                )
+            })?;
 
         Ok(Self {
             db_path,
@@ -230,20 +236,19 @@ where
     }
 
     async fn table_exists_with_name(&self, table_name: &str) -> Result<bool, String> {
-        let existing_table_name: Option<String> = sqlx::query_scalar(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
-        )
-        .bind(table_name)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| {
-            format!(
-                "Failed to query sqlite_master for table {} in {}: {}",
-                table_name,
-                self.db_path.display(),
-                e
-            )
-        })?;
+        let existing_table_name: Option<String> =
+            sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1")
+                .bind(table_name)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Failed to query sqlite_master for table {} in {}: {}",
+                        table_name,
+                        self.db_path.display(),
+                        e
+                    )
+                })?;
         Ok(existing_table_name.is_some())
     }
 

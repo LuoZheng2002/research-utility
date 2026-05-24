@@ -5,7 +5,8 @@ use tokio::sync::mpsc;
 
 use crate::message::WorkerMessage;
 
-pub static WORKER_MESSAGE_TX: ArcSwapOption<mpsc::UnboundedSender<WorkerMessage>> = ArcSwapOption::const_empty();
+pub static WORKER_MESSAGE_TX: ArcSwapOption<mpsc::UnboundedSender<WorkerMessage>> =
+    ArcSwapOption::const_empty();
 
 pub fn set_worker_message_tx(worker_message_tx: mpsc::UnboundedSender<WorkerMessage>) {
     WORKER_MESSAGE_TX.store(Some(Arc::new(worker_message_tx)));

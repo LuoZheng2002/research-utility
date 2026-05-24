@@ -20,9 +20,7 @@ use tokio::sync::mpsc;
 
 use crate::message::WorkerMessage;
 
-pub const PROGRESS_SCREEN_KEY_ORDER: &[&str] = &[
-    "status",
-];
+pub const PROGRESS_SCREEN_KEY_ORDER: &[&str] = &["status"];
 
 pub struct ProgressScreenConfig {
     pub window_title: String,
@@ -53,7 +51,9 @@ impl ProgressScreen {
         })
     }
     pub fn receive_message(&self, message: WorkerMessage) {
-        self.message_tx.send(message).expect("Failed to send message to ProgressScreen");
+        self.message_tx
+            .send(message)
+            .expect("Failed to send message to ProgressScreen");
     }
 
     pub fn clone_message_tx(&self) -> mpsc::UnboundedSender<WorkerMessage> {

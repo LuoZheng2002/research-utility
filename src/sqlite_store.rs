@@ -360,20 +360,19 @@ where
     }
 
     async fn table_exists(&self) -> bool {
-        let existing_table_name: Option<String> = sqlx::query_scalar(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
-        )
-        .bind(SQLITE_STORE_TABLE_NAME)
-        .fetch_optional(&self.pool)
-        .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "Failed to query sqlite_master for table {} in {}: {}",
-                SQLITE_STORE_TABLE_NAME,
-                self.db_path.display(),
-                e
-            )
-        });
+        let existing_table_name: Option<String> =
+            sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1")
+                .bind(SQLITE_STORE_TABLE_NAME)
+                .fetch_optional(&self.pool)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "Failed to query sqlite_master for table {} in {}: {}",
+                        SQLITE_STORE_TABLE_NAME,
+                        self.db_path.display(),
+                        e
+                    )
+                });
         existing_table_name.is_some()
     }
 }

@@ -1,17 +1,18 @@
 use base64::{Engine, engine::general_purpose};
 use serde::{Deserialize, Serialize};
 
+#[async_trait::async_trait]
 pub trait AssetFile {
     type FileModel;
     /// Checklist for implementers:
-    /// - Synchronize all dependency assets first by calling their `synchronize()` methods.
+    /// - Synchronize all dependency assets first by calling their `synchronize().await` methods.
     /// - Decide whether current output is stale:
     ///   - tracking file missing;
     ///   - target file missing while tracking exists;
     ///   - tracking file schema version exists and does not match current schema version;
     ///   - dependency hash mismatch versus tracking.
     /// - Regenerate output only when stale:
-    ///   - call dependency `fetch()` only in the regeneration path;
+    ///   - call dependency `fetch().await` only in the regeneration path;
     ///   - write target file atomically from regenerated content;
     ///   - compute and return current file hash.
     /// - Update/create tracking file so it records dependency hashes used for regeneration.
@@ -21,14 +22,14 @@ pub trait AssetFile {
     /// Reference implementations:
     /// `AssetFileTrees`, `AssetFileAdvantageComposition`,
     /// `AssetFileTrainingFormatted`, `AssetFileTrainingTokenized`, `AssetFileEmFit`.
-    fn synchronize(&self) -> Base64Hash;
+    async fn synchronize(&self) -> Base64Hash;
 
     /// Checklist for implementers:
-    /// - Call `self.synchronize()` first to ensure output is up-to-date.
+    /// - Call `self.synchronize().await` first to ensure output is up-to-date.
     /// - Read and deserialize the target file into `Self::FileModel`.
     /// - Panic/assert if the synchronized file cannot be read or parsed as expected.
     /// - Avoid hidden fallback behavior; fetch should reflect the synchronized source of truth.
-    fn fetch(&self) -> Self::FileModel;
+    async fn fetch(&self) -> Self::FileModel;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
