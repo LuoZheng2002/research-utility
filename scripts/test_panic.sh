@@ -1,0 +1,1 @@
+cargo run --bin bin_test_terminal_guard_panic

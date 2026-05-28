@@ -1,8 +1,11 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::fs::OpenOptions;
 use std::io;
-use std::sync::{Mutex, OnceLock};
+use std::io::Write;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use arc_swap::ArcSwapOption;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseEventKind},
     execute,
@@ -19,18 +22,21 @@ use ratatui::{
 use tokio::sync::{mpsc, oneshot};
 
 use crate::message::{MyLogMessage, Severity};
-use crate::my_log_message_tx::{clear_my_log_message_tx, set_my_log_message_tx};
 
 pub const PROGRESS_SCREEN_KEY_ORDER: &[&str] = &["status"];
 const MAX_LOG_LINES: usize = 100;
+const DEFAULT_REDRAW_INTERVAL: Duration = Duration::from_millis(100);
+const DEFAULT_PERSIST_EXIT_HINT: &str = "All tasks are done. Press Q to exit.";
 
-pub struct ProgressScreenConfig {
-    pub window_title: String,
-    pub steps_per_worker: usize,
-    pub key_order: Vec<String>,
-    pub redraw_interval: Duration,
-    pub persist_after_channel_close: bool,
-    pub persist_exit_hint: String,
+pub(crate) static PROGRESS_SCREEN_MESSAGE_TX: ArcSwapOption<mpsc::UnboundedSender<MyLogMessage>> =
+    ArcSwapOption::const_empty();
+
+struct RunConfig {
+    window_title: String,
+    key_order: Vec<String>,
+    redraw_interval: Duration,
+    persist_after_channel_close: bool,
+    persist_exit_hint: String,
 }
 
 pub struct ProgressScreen;
@@ -52,13 +58,11 @@ fn runtime_state() -> &'static Mutex<ProgressScreenRuntime> {
 }
 
 impl ProgressScreen {
-    pub async fn initialize(config: ProgressScreenConfig) -> io::Result<()> {
-        assert!(config.steps_per_worker > 0, "steps_per_worker must be > 0");
-        assert!(
-            !config.key_order.is_empty(),
-            "key_order must contain at least one key"
-        );
-
+    pub async fn initialize(
+        window_title: String,
+        persist_after_channel_close: bool,
+        log_file: Option<String>,
+    ) -> io::Result<()> {
         let mut runtime = runtime_state()
             .lock()
             .expect("progress screen runtime mutex poisoned");
@@ -66,11 +70,24 @@ impl ProgressScreen {
             return Ok(());
         }
 
+        let config = RunConfig {
+            window_title,
+            key_order: PROGRESS_SCREEN_KEY_ORDER
+                .iter()
+                .map(|key| (*key).to_string())
+                .collect(),
+            redraw_interval: DEFAULT_REDRAW_INTERVAL,
+            persist_after_channel_close,
+            persist_exit_hint: DEFAULT_PERSIST_EXIT_HINT.to_string(),
+        };
+
         let (my_log_message_tx, my_log_message_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        set_my_log_message_tx(my_log_message_tx);
+        // set_my_log_message_tx(my_log_message_tx);
+        PROGRESS_SCREEN_MESSAGE_TX.store(Some(Arc::new(my_log_message_tx)));
 
-        let join_handle = tokio::spawn(async move { Self::run(config, my_log_message_rx, shutdown_rx).await });
+        let join_handle =
+            tokio::spawn(async move { Self::run(config, my_log_message_rx, shutdown_rx, log_file).await });
         runtime.shutdown_tx = Some(shutdown_tx);
         runtime.join_handle = Some(join_handle);
         Ok(())
@@ -84,7 +101,8 @@ impl ProgressScreen {
             (runtime.shutdown_tx.take(), runtime.join_handle.take())
         };
 
-        clear_my_log_message_tx();
+        // clear_my_log_message_tx();
+        PROGRESS_SCREEN_MESSAGE_TX.store(None);
 
         if let Some(shutdown_tx) = shutdown_tx {
             let _ = shutdown_tx.send(());
@@ -102,9 +120,10 @@ impl ProgressScreen {
     }
 
     async fn run(
-        config: ProgressScreenConfig,
+        config: RunConfig,
         mut my_log_message_rx: mpsc::UnboundedReceiver<MyLogMessage>,
         mut shutdown_rx: oneshot::Receiver<()>,
+        log_file: Option<String>,
     ) -> io::Result<()> {
         let _terminal_guard = TerminalGuard::enter()?;
         let backend = CrosstermBackend::new(io::stdout());
@@ -114,12 +133,25 @@ impl ProgressScreen {
         let mut state = ProgressScreenState::new();
         let mut redraw_interval = tokio::time::interval(config.redraw_interval);
         let mut my_log_channel_closed = false;
+        let mut shutdown_requested = false;
+        let mut log_file_writer = log_file
+            .map(|path| {
+                OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(path)
+            })
+            .transpose()?;
 
         loop {
             tokio::select! {
                 recv_result = my_log_message_rx.recv() => {
                     match recv_result {
-                        Some(message) => state.handle_message(message),
+                        Some(message) => {
+                            write_line_to_log_file_if_enabled(&message, &mut log_file_writer)?;
+                            state.handle_message(message)
+                        }
                         None => {
                             my_log_channel_closed = true;
                             if !config.persist_after_channel_close {
@@ -132,7 +164,8 @@ impl ProgressScreen {
                     }
                     draw(&mut terminal, &mut state, &config, my_log_channel_closed)?;
                 }
-                _ = &mut shutdown_rx => {
+                _ = &mut shutdown_rx, if !shutdown_requested => {
+                    shutdown_requested = true;
                     my_log_channel_closed = true;
                     if !config.persist_after_channel_close {
                         break;
@@ -152,24 +185,6 @@ impl ProgressScreen {
         }
 
         Ok(())
-    }
-}
-
-impl ProgressScreenConfig {
-    pub fn from_defaults(num_workers: usize, steps_per_worker: usize) -> Self {
-        assert!(num_workers > 0, "num_workers must be > 0");
-        assert!(steps_per_worker > 0, "steps_per_worker must be > 0");
-        Self {
-            window_title: "Progress Window".to_string(),
-            steps_per_worker,
-            key_order: PROGRESS_SCREEN_KEY_ORDER
-                .iter()
-                .map(|key| (*key).to_string())
-                .collect(),
-            redraw_interval: Duration::from_millis(100),
-            persist_after_channel_close: false,
-            persist_exit_hint: "All tasks are done. Press Q to exit.".to_string(),
-        }
     }
 }
 
@@ -309,7 +324,7 @@ fn handle_input_events(state: &mut ProgressScreenState) -> io::Result<bool> {
 fn draw(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &mut ProgressScreenState,
-    config: &ProgressScreenConfig,
+    config: &RunConfig,
     my_log_channel_closed: bool,
 ) -> io::Result<()> {
     terminal.draw(|frame| {
@@ -467,4 +482,20 @@ fn visible_log_lines(
 
 fn log_inner_height(log_area: ratatui::layout::Rect) -> usize {
     log_area.height.saturating_sub(2) as usize
+}
+
+fn write_line_to_log_file_if_enabled(
+    message: &MyLogMessage,
+    log_file_writer: &mut Option<std::fs::File>,
+) -> io::Result<()> {
+    let Some(file) = log_file_writer.as_mut() else {
+        return Ok(());
+    };
+
+    if let MyLogMessage::Line { message, .. } = message {
+        file.write_all(message.as_bytes())?;
+        file.write_all(b"\n")?;
+    }
+
+    Ok(())
 }

@@ -2,22 +2,18 @@ use std::io;
 use std::time::Duration;
 
 use research_utility::message::{MyLogMessage, Severity};
-use research_utility::my_log_message_tx::{
-    log_key_value_pair, log_master_progress, log_message, log_worker_progress,
+use research_utility::log_message::{
+    log_key_value_pair, log_master_progress, log_message, log_worker_progress
 };
-use research_utility::progress_screen::{ProgressScreen, ProgressScreenConfig};
+use research_utility::progress_screen::ProgressScreen;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let num_workers = 6;
     let steps_per_worker = 40;
 
-    let mut config = ProgressScreenConfig::from_defaults(num_workers, steps_per_worker);
-    config.window_title = "Progress Screen Preview".to_string();
-    config.persist_after_channel_close = true;
-    config.persist_exit_hint = "Demo complete. Press Q to exit.".to_string();
-
-    ProgressScreen::initialize(config).await?;
+    let log_file = Some("test.log".to_string());
+    ProgressScreen::initialize("Progress Screen Preview".to_string(), true, log_file).await?;
     simulate_progress(num_workers, steps_per_worker).await;
     ProgressScreen::shutdown().await
 }
