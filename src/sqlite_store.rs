@@ -69,7 +69,7 @@ where
     K: SqliteStoreKey,
     V: Serialize + DeserializeOwned,
 {
-    pub async fn initialize(db_path: impl Into<PathBuf>) -> Self {
+    pub async fn initialize(db_path: impl Into<PathBuf>, max_connections: u32) -> Self {
         let db_path = db_path.into();
         assert!(
             !db_path.exists(),
@@ -91,7 +91,7 @@ where
             .filename(&db_path)
             .create_if_missing(true);
         let pool = SqlitePoolOptions::new()
-            .max_connections(1)
+            .max_connections(max_connections)
             .connect_with(connect_options)
             .await
             .unwrap_or_else(|e| {
@@ -133,7 +133,7 @@ where
         store
     }
 
-    pub async fn assume_initialized(db_path: impl Into<PathBuf>) -> Self {
+    pub async fn assume_initialized(db_path: impl Into<PathBuf>, max_connections: u32) -> Self {
         let db_path = db_path.into();
         assert!(
             db_path.exists(),
@@ -146,7 +146,7 @@ where
             .filename(&db_path)
             .create_if_missing(false);
         let pool = SqlitePoolOptions::new()
-            .max_connections(1)
+            .max_connections(max_connections)
             .connect_with(connect_options)
             .await
             .unwrap_or_else(|e| {
@@ -174,10 +174,10 @@ where
         store
     }
 
-    pub async fn initialize_if_missing(db_path: impl Into<PathBuf>) -> Self {
+    pub async fn initialize_if_missing(db_path: impl Into<PathBuf>, max_connections: u32) -> Self {
         let db_path = db_path.into();
         if db_path.exists() {
-            let store = Self::assume_initialized(db_path).await;
+            let store = Self::assume_initialized(db_path, max_connections).await;
             assert!(
                 store.table_exists().await,
                 "Expected sqlite table {} to exist in {} when initializing-if-missing",
@@ -186,7 +186,7 @@ where
             );
             store
         } else {
-            Self::initialize(db_path).await
+            Self::initialize(db_path, max_connections).await
         }
     }
 
