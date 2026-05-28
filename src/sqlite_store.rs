@@ -121,6 +121,14 @@ where
         false
     }
 
+    fn is_pool_timeout(error: &sqlx::Error) -> bool {
+        matches!(error, sqlx::Error::PoolTimedOut)
+    }
+
+    fn is_retryable_write_error(error: &sqlx::Error) -> bool {
+        Self::is_sqlite_busy_or_locked(error) || Self::is_pool_timeout(error)
+    }
+
     fn busy_retry_delay(attempt: usize, base_delay_ms: u64) -> Duration {
         let shift = attempt.min(8);
         Duration::from_millis(base_delay_ms * (1_u64 << shift))
@@ -314,8 +322,7 @@ where
             .await
             {
                 Ok(_) => return Ok(()),
-                Err(error) if Self::is_sqlite_busy_or_locked(&error) && attempt < max_retries =>
-                {
+                Err(error) if Self::is_retryable_write_error(&error) && attempt < max_retries => {
                     tokio::time::sleep(Self::busy_retry_delay(attempt, base_delay_ms)).await;
                 }
                 Err(error) => {
