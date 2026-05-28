@@ -6,6 +6,7 @@ const SQLITE_STORE_TABLE_NAME: &str = "store_entries";
 const SQLITE_BUSY_MAX_RETRIES: usize = 12;
 const SQLITE_BUSY_BASE_DELAY_MS: u64 = 25;
 const SQLITE_BUSY_TIMEOUT_SECS: u64 = 30;
+const SQLITE_POOL_ACQUIRE_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SqliteBusyRetryConfig {
@@ -146,6 +147,7 @@ where
         let connect_options = Self::sqlite_connect_options(&db_path, true);
         let pool = SqlitePoolOptions::new()
             .max_connections(max_connections)
+            .acquire_timeout(Duration::from_secs(SQLITE_POOL_ACQUIRE_TIMEOUT_SECS))
             .connect_with(connect_options)
             .await
             .unwrap_or_else(|e| {
@@ -199,6 +201,7 @@ where
         let connect_options = Self::sqlite_connect_options(&db_path, false);
         let pool = SqlitePoolOptions::new()
             .max_connections(max_connections)
+            .acquire_timeout(Duration::from_secs(SQLITE_POOL_ACQUIRE_TIMEOUT_SECS))
             .connect_with(connect_options)
             .await
             .unwrap_or_else(|e| {
