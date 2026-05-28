@@ -1,14 +1,16 @@
 // for communicating about rollout progress, training stats, etc.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Severity{
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
     Info,
     Warning,
     Error,
 }
-#[derive(Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum MyLogMessage {
-    Line{        
+    Line {
         message: String,
         severity: Severity,
     },

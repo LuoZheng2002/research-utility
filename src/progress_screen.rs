@@ -59,7 +59,7 @@ fn runtime_state() -> &'static Mutex<ProgressScreenRuntime> {
 
 impl ProgressScreen {
     pub async fn initialize(
-        window_title: String,
+        window_title: impl Into<String>,
         persist_after_channel_close: bool,
         log_file: Option<String>,
     ) -> io::Result<()> {
@@ -71,7 +71,7 @@ impl ProgressScreen {
         }
 
         let config = RunConfig {
-            window_title,
+            window_title: window_title.into(),
             key_order: PROGRESS_SCREEN_KEY_ORDER
                 .iter()
                 .map(|key| (*key).to_string())
@@ -86,8 +86,9 @@ impl ProgressScreen {
         // set_my_log_message_tx(my_log_message_tx);
         PROGRESS_SCREEN_MESSAGE_TX.store(Some(Arc::new(my_log_message_tx)));
 
-        let join_handle =
-            tokio::spawn(async move { Self::run(config, my_log_message_rx, shutdown_rx, log_file).await });
+        let join_handle = tokio::spawn(async move {
+            Self::run(config, my_log_message_rx, shutdown_rx, log_file).await
+        });
         runtime.shutdown_tx = Some(shutdown_tx);
         runtime.join_handle = Some(join_handle);
         Ok(())

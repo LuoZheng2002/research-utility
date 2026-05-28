@@ -42,7 +42,11 @@ pub fn log_master_progress(progress: f32, label: impl Into<String>) {
     log_message(MyLogMessage::MasterProgress { progress, label });
 }
 
-pub fn log_worker_progress(worker_name: impl Into<String>, progress: f32, label: impl Into<String>) {
+pub fn log_worker_progress(
+    worker_name: impl Into<String>,
+    progress: f32,
+    label: impl Into<String>,
+) {
     let worker_name = worker_name.into();
     let label = label.into();
     log_message(MyLogMessage::WorkerProgress {

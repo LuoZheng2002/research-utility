@@ -6,12 +6,7 @@ use research_utility::progress_screen::ProgressScreen;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    ProgressScreen::initialize(
-        "Terminal Guard Panic Test".to_string(),
-        false,
-        None,
-    )
-    .await?;
+    ProgressScreen::initialize("Terminal Guard Panic Test".to_string(), false, None).await?;
 
     log_key_value_pair(
         "status".to_string(),

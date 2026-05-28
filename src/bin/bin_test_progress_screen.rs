@@ -1,10 +1,10 @@
 use std::io;
 use std::time::Duration;
 
-use research_utility::message::{MyLogMessage, Severity};
 use research_utility::log_message::{
-    log_key_value_pair, log_master_progress, log_message, log_worker_progress
+    log_key_value_pair, log_master_progress, log_message, log_worker_progress,
 };
+use research_utility::message::{MyLogMessage, Severity};
 use research_utility::progress_screen::ProgressScreen;
 
 #[tokio::main]
@@ -86,9 +86,9 @@ async fn simulate_progress(num_workers: usize, steps_per_worker: usize) {
             master_progress * 100.0
         );
         log_message(MyLogMessage::Line {
-                message: log_line,
-                severity,
-            });
+            message: log_line,
+            severity,
+        });
 
         tokio::time::sleep(Duration::from_millis(120)).await;
     }
