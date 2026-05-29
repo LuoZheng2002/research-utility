@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::OpenOptions;
 use std::io;
 use std::io::Write;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
@@ -26,7 +26,8 @@ use crate::message::{MyLogMessage, Severity};
 pub const PROGRESS_SCREEN_KEY_ORDER: &[&str] = &["status"];
 const MAX_LOG_LINES: usize = 100;
 const DEFAULT_REDRAW_INTERVAL: Duration = Duration::from_millis(100);
-const DEFAULT_PERSIST_EXIT_HINT: &str = "All tasks are done. Press Q to exit.";
+const DEFAULT_PERSIST_EXIT_HINT: &str = "All tasks are done.";
+const PRESS_Q_TO_EXIT_HINT: &str = " Press Q to exit.";
 
 pub(crate) static PROGRESS_SCREEN_MESSAGE_TX: ArcSwapOption<mpsc::UnboundedSender<MyLogMessage>> =
     ArcSwapOption::const_empty();
@@ -36,7 +37,6 @@ struct RunConfig {
     key_order: Vec<String>,
     redraw_interval: Duration,
     persist_after_channel_close: bool,
-    persist_exit_hint: String,
 }
 
 pub struct ProgressScreen;
@@ -47,6 +47,9 @@ struct ProgressScreenRuntime {
 }
 
 static PROGRESS_SCREEN_RUNTIME: OnceLock<Mutex<ProgressScreenRuntime>> = OnceLock::new();
+
+static PERSISTENT_EXIT_HINT: LazyLock<Mutex<String>> =
+    LazyLock::new(|| Mutex::new(DEFAULT_PERSIST_EXIT_HINT.to_string()));
 
 fn runtime_state() -> &'static Mutex<ProgressScreenRuntime> {
     PROGRESS_SCREEN_RUNTIME.get_or_init(|| {
@@ -78,7 +81,6 @@ impl ProgressScreen {
                 .collect(),
             redraw_interval: DEFAULT_REDRAW_INTERVAL,
             persist_after_channel_close,
-            persist_exit_hint: DEFAULT_PERSIST_EXIT_HINT.to_string(),
         };
 
         let (my_log_message_tx, my_log_message_rx) = mpsc::unbounded_channel();
@@ -118,6 +120,12 @@ impl ProgressScreen {
             },
             None => Ok(()),
         }
+    }
+    pub fn set_persist_exit_hint(hint: impl Into<String>) {
+        let mut guard = PERSISTENT_EXIT_HINT
+            .lock()
+            .expect("persistent exit hint mutex poisoned");
+        *guard = hint.into();
     }
 
     async fn run(
@@ -408,11 +416,13 @@ fn draw(
         frame.render_widget(master_gauge, main_layout[2]);
 
         if show_persist_exit_hint {
-            let hint = Paragraph::new(config.persist_exit_hint.as_str()).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Program Ended"),
-            );
+            let hint =
+                Paragraph::new(PERSISTENT_EXIT_HINT.lock().unwrap().clone() + PRESS_Q_TO_EXIT_HINT)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title("Program Ended"),
+                    );
             frame.render_widget(hint, main_layout[3]);
         }
     })?;
