@@ -4,7 +4,8 @@ pub fn log_message(message: MyLogMessage) {
     if let Some(my_log_message_tx) = PROGRESS_SCREEN_MESSAGE_TX.load_full() {
         my_log_message_tx
             .send(message)
-            .expect("failed to send worker message");
+            .map_err(|e| format!("Failed to send message: {}", e))
+            .unwrap();
     } else {
         println!("{}", message.to_string());
     }
