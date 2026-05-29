@@ -2,10 +2,7 @@ use crate::{message::MyLogMessage, progress_screen::PROGRESS_SCREEN_MESSAGE_TX};
 
 pub fn log_message(message: MyLogMessage) {
     if let Some(my_log_message_tx) = PROGRESS_SCREEN_MESSAGE_TX.load_full() {
-        my_log_message_tx
-            .send(message)
-            .map_err(|e| format!("Failed to send message: {}", e))
-            .unwrap();
+        let _ = my_log_message_tx.send(message);
     } else {
         println!("{}", message.to_string());
     }
