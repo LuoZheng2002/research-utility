@@ -279,12 +279,10 @@ impl ProgressScreenState {
         if self.log_lines.len() > MAX_LOG_LINES {
             self.log_lines.pop_front();
         }
-        self.clamp_scroll();
     }
 
     fn scroll_log_up(&mut self, amount: usize) {
         self.log_scroll_from_bottom = self.log_scroll_from_bottom.saturating_add(amount);
-        self.clamp_scroll();
     }
 
     fn scroll_log_down(&mut self, amount: usize) {
@@ -327,11 +325,8 @@ impl ProgressScreenState {
         }
     }
 
-    fn clamp_scroll(&mut self) {
-        let max_scroll = self
-            .log_lines
-            .len()
-            .saturating_sub(self.log_viewport_height.max(1));
+    fn clamp_log_scroll(&mut self, log_line_count: usize) {
+        let max_scroll = log_line_count.saturating_sub(self.log_viewport_height.max(1));
         if self.log_scroll_from_bottom > max_scroll {
             self.log_scroll_from_bottom = max_scroll;
         }
@@ -405,10 +400,10 @@ fn draw(
 
         let ordered_lines = ordered_key_value_lines(&state.key_values, &config.key_order);
         state.stats_viewport_height = log_inner_height(stats_layout[0]);
-        state.clamp_stats_scroll(ordered_lines.len());
-        let stats_max_scroll = ordered_lines
-            .len()
-            .saturating_sub(state.stats_viewport_height.max(1));
+        let stats_inner_width = log_inner_width(stats_layout[0]);
+        let stats_total_rows = wrapped_lines_height(&ordered_lines, stats_inner_width);
+        state.clamp_stats_scroll(stats_total_rows);
+        let stats_max_scroll = stats_total_rows.saturating_sub(state.stats_viewport_height.max(1));
         let stats_scroll_from_top =
             stats_max_scroll.saturating_sub(state.stats_scroll_from_bottom) as u16;
         let key_value_window = Paragraph::new(ordered_lines)
@@ -425,11 +420,11 @@ fn draw(
         frame.render_widget(key_value_window, stats_layout[0]);
 
         state.log_viewport_height = log_inner_height(stats_layout[1]);
-        state.clamp_scroll();
-        let max_scroll = state
-            .log_lines
-            .len()
-            .saturating_sub(state.log_viewport_height.max(1));
+        let log_inner_width = log_inner_width(stats_layout[1]);
+        let log_lines = rendered_log_lines(&state.log_lines);
+        let log_total_rows = wrapped_lines_height(&log_lines, log_inner_width);
+        state.clamp_log_scroll(log_total_rows);
+        let max_scroll = log_total_rows.saturating_sub(state.log_viewport_height.max(1));
         let log_block = Block::default().borders(Borders::ALL).title(format!(
             "Log ({}/{MAX_LOG_LINES}, offset {}/{})",
             state.log_lines.len(),
@@ -437,7 +432,6 @@ fn draw(
             max_scroll
         ));
         let log_scroll_from_top = max_scroll.saturating_sub(state.log_scroll_from_bottom) as u16;
-        let log_lines = rendered_log_lines(&state.log_lines);
         let log_window = Paragraph::new(log_lines)
             .block(log_block)
             .scroll((log_scroll_from_top, 0))
@@ -544,6 +538,21 @@ fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
 
 fn log_inner_height(log_area: ratatui::layout::Rect) -> usize {
     log_area.height.saturating_sub(2) as usize
+}
+
+fn log_inner_width(log_area: ratatui::layout::Rect) -> usize {
+    log_area.width.saturating_sub(2) as usize
+}
+
+fn wrapped_lines_height(lines: &[Line<'_>], inner_width: usize) -> usize {
+    if inner_width == 0 {
+        return 0;
+    }
+
+    lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(inner_width))
+        .sum()
 }
 
 fn write_line_to_log_file_if_enabled(
