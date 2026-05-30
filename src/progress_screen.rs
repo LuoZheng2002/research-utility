@@ -14,7 +14,7 @@ use crossterm::{
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Gauge, Paragraph, Wrap},
@@ -204,9 +204,13 @@ struct MasterOrWorkerProgress {
 
 struct ProgressScreenState {
     key_values: HashMap<String, String>,
+    stats_scroll_from_bottom: usize,
+    stats_viewport_height: usize,
     log_lines: VecDeque<LogLine>,
     log_scroll_from_bottom: usize,
     log_viewport_height: usize,
+    stats_area: Rect,
+    log_area: Rect,
     worker_progress: BTreeMap<String, MasterOrWorkerProgress>,
     master_progress: MasterOrWorkerProgress,
 }
@@ -220,9 +224,13 @@ impl ProgressScreenState {
     fn new() -> Self {
         Self {
             key_values: HashMap::new(),
+            stats_scroll_from_bottom: 0,
+            stats_viewport_height: 1,
             log_lines: VecDeque::new(),
             log_scroll_from_bottom: 0,
             log_viewport_height: 1,
+            stats_area: Rect::default(),
+            log_area: Rect::default(),
             worker_progress: BTreeMap::new(),
             master_progress: MasterOrWorkerProgress {
                 progress: 0.0,
@@ -283,6 +291,42 @@ impl ProgressScreenState {
         self.log_scroll_from_bottom = self.log_scroll_from_bottom.saturating_sub(amount);
     }
 
+    fn scroll_stats_up(&mut self, amount: usize) {
+        self.stats_scroll_from_bottom = self.stats_scroll_from_bottom.saturating_add(amount);
+    }
+
+    fn scroll_stats_down(&mut self, amount: usize) {
+        self.stats_scroll_from_bottom = self.stats_scroll_from_bottom.saturating_sub(amount);
+    }
+
+    fn scroll_top_window_up(&mut self, mouse_x: u16, mouse_y: u16, amount: usize) {
+        if rect_contains(self.stats_area, mouse_x, mouse_y) {
+            self.scroll_stats_up(amount);
+        } else if rect_contains(self.log_area, mouse_x, mouse_y) {
+            self.scroll_log_up(amount);
+        }
+    }
+
+    fn scroll_top_window_down(&mut self, mouse_x: u16, mouse_y: u16, amount: usize) {
+        if rect_contains(self.stats_area, mouse_x, mouse_y) {
+            self.scroll_stats_down(amount);
+        } else if rect_contains(self.log_area, mouse_x, mouse_y) {
+            self.scroll_log_down(amount);
+        }
+    }
+
+    fn set_top_window_areas(&mut self, stats_area: Rect, log_area: Rect) {
+        self.stats_area = stats_area;
+        self.log_area = log_area;
+    }
+
+    fn clamp_stats_scroll(&mut self, stats_line_count: usize) {
+        let max_scroll = stats_line_count.saturating_sub(self.stats_viewport_height.max(1));
+        if self.stats_scroll_from_bottom > max_scroll {
+            self.stats_scroll_from_bottom = max_scroll;
+        }
+    }
+
     fn clamp_scroll(&mut self) {
         let max_scroll = self
             .log_lines
@@ -320,8 +364,12 @@ fn handle_input_events(state: &mut ProgressScreenState) -> io::Result<bool> {
                 }
             }
             Event::Mouse(mouse_event) => match mouse_event.kind {
-                MouseEventKind::ScrollUp => state.scroll_log_up(1),
-                MouseEventKind::ScrollDown => state.scroll_log_down(1),
+                MouseEventKind::ScrollUp => {
+                    state.scroll_top_window_up(mouse_event.column, mouse_event.row, 1)
+                }
+                MouseEventKind::ScrollDown => {
+                    state.scroll_top_window_down(mouse_event.column, mouse_event.row, 1)
+                }
                 _ => {}
             },
             _ => {}
@@ -353,14 +401,26 @@ fn draw(
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(main_layout[0]);
+        state.set_top_window_areas(stats_layout[0], stats_layout[1]);
 
         let ordered_lines = ordered_key_value_lines(&state.key_values, &config.key_order);
+        state.stats_viewport_height = log_inner_height(stats_layout[0]);
+        state.clamp_stats_scroll(ordered_lines.len());
+        let stats_max_scroll = ordered_lines
+            .len()
+            .saturating_sub(state.stats_viewport_height.max(1));
+        let stats_scroll_from_top =
+            stats_max_scroll.saturating_sub(state.stats_scroll_from_bottom) as u16;
         let key_value_window = Paragraph::new(ordered_lines)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(format!("{} - Stats", config.window_title)),
+                    .title(format!(
+                        "{} - Stats (offset {}/{})",
+                        config.window_title, state.stats_scroll_from_bottom, stats_max_scroll
+                    )),
             )
+            .scroll((stats_scroll_from_top, 0))
             .wrap(Wrap { trim: false });
         frame.render_widget(key_value_window, stats_layout[0]);
 
@@ -376,15 +436,13 @@ fn draw(
             state.log_scroll_from_bottom,
             max_scroll
         ));
-        let log_inner = log_block.inner(stats_layout[1]);
-        frame.render_widget(log_block, stats_layout[1]);
-
-        let log_lines = visible_log_lines(
-            &state.log_lines,
-            state.log_scroll_from_bottom,
-            log_inner.height as usize,
-        );
-        frame.render_widget(Paragraph::new(log_lines), log_inner);
+        let log_scroll_from_top = max_scroll.saturating_sub(state.log_scroll_from_bottom) as u16;
+        let log_lines = rendered_log_lines(&state.log_lines);
+        let log_window = Paragraph::new(log_lines)
+            .block(log_block)
+            .scroll((log_scroll_from_top, 0))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(log_window, stats_layout[1]);
 
         let workers_block = Block::default().borders(Borders::ALL).title("Endpoints");
         let workers_inner = workers_block.inner(main_layout[1]);
@@ -460,26 +518,13 @@ fn ordered_key_value_lines(
         .collect()
 }
 
-fn visible_log_lines(
-    log_lines: &VecDeque<LogLine>,
-    scroll_from_bottom: usize,
-    viewport_height: usize,
-) -> Vec<Line<'static>> {
+fn rendered_log_lines(log_lines: &VecDeque<LogLine>) -> Vec<Line<'static>> {
     if log_lines.is_empty() {
         return vec![Line::from("No logs yet")];
     }
 
-    let height = viewport_height.max(1);
-    let total = log_lines.len();
-    let max_scroll = total.saturating_sub(height);
-    let clamped_scroll = scroll_from_bottom.min(max_scroll);
-    let end_exclusive = total.saturating_sub(clamped_scroll);
-    let start = end_exclusive.saturating_sub(height);
-
     log_lines
         .iter()
-        .skip(start)
-        .take(end_exclusive.saturating_sub(start))
         .map(|line| {
             let style = match line.severity {
                 Severity::Info => Style::default().fg(Color::White),
@@ -489,6 +534,12 @@ fn visible_log_lines(
             Line::from(Span::styled(line.message.clone(), style))
         })
         .collect()
+}
+
+fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
+    let max_x = rect.x.saturating_add(rect.width);
+    let max_y = rect.y.saturating_add(rect.height);
+    x >= rect.x && x < max_x && y >= rect.y && y < max_y
 }
 
 fn log_inner_height(log_area: ratatui::layout::Rect) -> usize {
