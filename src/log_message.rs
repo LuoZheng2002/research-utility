@@ -53,3 +53,8 @@ pub fn log_worker_progress(
         label,
     });
 }
+
+pub fn delete_worker_progress_bar(worker_name: impl Into<String>) {
+    let worker_name = worker_name.into();
+    log_message(MyLogMessage::DeleteWorkerBar { worker_name });
+}

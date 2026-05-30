@@ -268,6 +268,9 @@ impl ProgressScreenState {
                 );
                 self.master_progress = MasterOrWorkerProgress { progress, label };
             }
+            MyLogMessage::DeleteWorkerBar { worker_name } => {
+                self.worker_progress.remove(&worker_name);
+            }
         }
     }
 

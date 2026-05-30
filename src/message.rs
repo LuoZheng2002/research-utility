@@ -19,7 +19,6 @@ pub enum MyLogMessage {
         value: String,
     },
     WorkerProgress {
-        // worker_id: usize,
         worker_name: String,
         progress: f32,
         label: String,
@@ -28,22 +27,12 @@ pub enum MyLogMessage {
         progress: f32,
         label: String,
     },
+    DeleteWorkerBar {
+        worker_name: String,
+    },
 }
 
 impl MyLogMessage {
-    pub fn key_value_pair(key: String, value: String) -> Self {
-        MyLogMessage::KeyValuePair { key, value }
-    }
-    pub fn master_progress(progress: f32, label: String) -> Self {
-        MyLogMessage::MasterProgress { progress, label }
-    }
-    pub fn worker_progress(worker_name: String, progress: f32, label: String) -> Self {
-        MyLogMessage::WorkerProgress {
-            worker_name,
-            progress,
-            label,
-        }
-    }
     pub fn to_string(&self) -> String {
         match self {
             MyLogMessage::Line { message, severity } => match severity {
@@ -59,6 +48,9 @@ impl MyLogMessage {
             } => format!("Worker {worker_name} Progress - {label}: {progress:.2}%"),
             MyLogMessage::MasterProgress { progress, label } => {
                 format!("Master Progress - {label}: {progress:.2}%")
+            }
+            MyLogMessage::DeleteWorkerBar { worker_name } => {
+                format!("Delete progress bar for worker {worker_name}")
             }
         }
     }
