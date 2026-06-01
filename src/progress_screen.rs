@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::OpenOptions;
 use std::io;
 use std::io::Write;
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
@@ -46,14 +46,14 @@ struct ProgressScreenRuntime {
     shutdown_tx: Option<oneshot::Sender<()>>,
 }
 
-static PROGRESS_SCREEN_RUNTIME: OnceLock<Mutex<ProgressScreenRuntime>> = OnceLock::new();
+static PROGRESS_SCREEN_RUNTIME: OnceLock<std::sync::Mutex<ProgressScreenRuntime>> = OnceLock::new();
 
-static PERSISTENT_EXIT_HINT: LazyLock<Mutex<String>> =
-    LazyLock::new(|| Mutex::new(DEFAULT_PERSIST_EXIT_HINT.to_string()));
+static PERSISTENT_EXIT_HINT: LazyLock<std::sync::Mutex<String>> =
+    LazyLock::new(|| std::sync::Mutex::new(DEFAULT_PERSIST_EXIT_HINT.to_string()));
 
-fn runtime_state() -> &'static Mutex<ProgressScreenRuntime> {
+fn runtime_state() -> &'static std::sync::Mutex<ProgressScreenRuntime> {
     PROGRESS_SCREEN_RUNTIME.get_or_init(|| {
-        Mutex::new(ProgressScreenRuntime {
+        std::sync::Mutex::new(ProgressScreenRuntime {
             join_handle: None,
             shutdown_tx: None,
         })
@@ -410,14 +410,10 @@ fn draw(
         let stats_scroll_from_top =
             stats_max_scroll.saturating_sub(state.stats_scroll_from_bottom) as u16;
         let key_value_window = Paragraph::new(ordered_lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(
-                        "{} - Stats (offset {}/{})",
-                        config.window_title, state.stats_scroll_from_bottom, stats_max_scroll
-                    )),
-            )
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                "{} - Stats (offset {}/{})",
+                config.window_title, state.stats_scroll_from_bottom, stats_max_scroll
+            )))
             .scroll((stats_scroll_from_top, 0))
             .wrap(Wrap { trim: false });
         frame.render_widget(key_value_window, stats_layout[0]);

@@ -9,9 +9,8 @@ async-trait = "0.1.89"
 base64 = "0.22.1"
 blake3 = "1.8.5"
 crossterm = "0.29.0"
-libsqlite3-sys = { version = "0.30.1", features = ["bundled"] }
 ratatui = "0.30.0"
 rmp-serde = "1.3.0"
+rusqlite = { version = "0.37.0", features = ["bundled"] }
 serde = {version="1.0.228",features=["derive"]}
-sqlx = { version = "0.8.6", features = ["sqlite", "runtime-tokio-rustls"] }
 tokio = {version="1.50.0", features=["full"]}

@@ -1,12 +1,11 @@
+use rusqlite::{Connection, Error as RusqliteError, ErrorCode, OptionalExtension, params};
 use serde::{Serialize, de::DeserializeOwned};
-use sqlx::{Row, SqlitePool, sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions};
-use std::{marker::PhantomData, path::PathBuf, time::Duration};
+use std::{marker::PhantomData, path::PathBuf, sync::Arc, time::Duration};
 
 const SQLITE_STORE_TABLE_NAME: &str = "store_entries";
 const SQLITE_BUSY_MAX_RETRIES: usize = 12;
 const SQLITE_BUSY_BASE_DELAY_MS: u64 = 25;
 const SQLITE_BUSY_TIMEOUT_SECS: u64 = 30;
-const SQLITE_POOL_ACQUIRE_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SqliteBusyRetryConfig {
@@ -77,7 +76,7 @@ impl SqliteStoreKey for String {
 #[derive(Debug)]
 pub struct SqliteStore<K, V> {
     db_path: PathBuf,
-    pool: SqlitePool,
+    connection: Arc<std::sync::Mutex<Connection>>,
     key_marker: PhantomData<K>,
     value_marker: PhantomData<V>,
 }
@@ -86,7 +85,7 @@ impl<K, V> Clone for SqliteStore<K, V> {
     fn clone(&self) -> Self {
         Self {
             db_path: self.db_path.clone(),
-            pool: self.pool.clone(),
+            connection: Arc::clone(&self.connection),
             key_marker: PhantomData,
             value_marker: PhantomData,
         }
@@ -98,35 +97,68 @@ where
     K: SqliteStoreKey,
     V: Serialize + DeserializeOwned,
 {
-    fn sqlite_connect_options(db_path: &PathBuf, create_if_missing: bool) -> SqliteConnectOptions {
-        SqliteConnectOptions::new()
-            .filename(db_path)
-            .create_if_missing(create_if_missing)
+    fn open_connection(db_path: &PathBuf, create_if_missing: bool) -> Result<Connection, String> {
+        let flags = if create_if_missing {
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+        } else {
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI
+        };
+
+        let connection = Connection::open_with_flags(db_path, flags).map_err(|e| {
+            format!(
+                "Failed to open sqlite database {} for table {}: {}",
+                db_path.display(),
+                SQLITE_STORE_TABLE_NAME,
+                e
+            )
+        })?;
+
+        connection
             .busy_timeout(Duration::from_secs(SQLITE_BUSY_TIMEOUT_SECS))
-            .pragma("journal_mode", "WAL")
-            .pragma("synchronous", "NORMAL")
+            .map_err(|e| {
+                format!(
+                    "Failed to set sqlite busy timeout on {}: {}",
+                    db_path.display(),
+                    e
+                )
+            })?;
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| {
+                format!(
+                    "Failed to set sqlite journal_mode on {}: {}",
+                    db_path.display(),
+                    e
+                )
+            })?;
+        connection
+            .pragma_update(None, "synchronous", "NORMAL")
+            .map_err(|e| {
+                format!(
+                    "Failed to set sqlite synchronous pragma on {}: {}",
+                    db_path.display(),
+                    e
+                )
+            })?;
+
+        Ok(connection)
     }
 
-    fn is_sqlite_busy_or_locked(error: &sqlx::Error) -> bool {
+    fn is_sqlite_busy_or_locked(error: &RusqliteError) -> bool {
         let message = error.to_string().to_ascii_lowercase();
         if message.contains("database is locked") || message.contains("database table is locked") {
             return true;
         }
-        let sqlx::Error::Database(database_error) = error else {
+
+        let RusqliteError::SqliteFailure(sqlite_error, _) = error else {
             return false;
         };
-        if let Some(code) = database_error.code() {
-            return code == "5" || code == "6";
-        }
-        false
-    }
-
-    fn is_pool_timeout(error: &sqlx::Error) -> bool {
-        matches!(error, sqlx::Error::PoolTimedOut)
-    }
-
-    fn is_retryable_write_error(error: &sqlx::Error) -> bool {
-        Self::is_sqlite_busy_or_locked(error) || Self::is_pool_timeout(error)
+        matches!(
+            sqlite_error.code,
+            ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
+        )
     }
 
     fn busy_retry_delay(attempt: usize, base_delay_ms: u64) -> Duration {
@@ -134,7 +166,7 @@ where
         Duration::from_millis(base_delay_ms * (1_u64 << shift))
     }
 
-    pub async fn initialize(db_path: impl Into<PathBuf>, max_connections: u32) -> Self {
+    pub async fn initialize(db_path: impl Into<PathBuf>) -> Self {
         let db_path = db_path.into();
         assert!(
             !db_path.exists(),
@@ -152,52 +184,44 @@ where
             });
         }
 
-        let connect_options = Self::sqlite_connect_options(&db_path, true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(max_connections)
-            .acquire_timeout(Duration::from_secs(SQLITE_POOL_ACQUIRE_TIMEOUT_SECS))
-            .connect_with(connect_options)
-            .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "Failed to open sqlite database {} for table {}: {}",
-                    db_path.display(),
-                    SQLITE_STORE_TABLE_NAME,
-                    e
-                )
-            });
+        let connection = Self::open_connection(&db_path, true).unwrap_or_else(|e| panic!("{}", e));
 
         let store = Self {
             db_path,
-            pool,
+            connection: Arc::new(std::sync::Mutex::new(connection)),
             key_marker: PhantomData,
             value_marker: PhantomData,
         };
 
-        sqlx::query(&format!(
-            "
-            CREATE TABLE IF NOT EXISTS {} (
-                id TEXT PRIMARY KEY,
-                payload_msgpack BLOB NOT NULL
-            )
-            ",
-            SQLITE_STORE_TABLE_NAME
-        ))
-        .execute(&store.pool)
-        .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "Failed to initialize sqlite table {} in {}: {}",
-                SQLITE_STORE_TABLE_NAME,
-                store.db_path.display(),
-                e
-            )
-        });
+        {
+            let connection = store.connection.lock().expect("sqlite mutex poisoned");
+            connection
+                .execute(
+                    &format!(
+                        "
+                        CREATE TABLE IF NOT EXISTS {} (
+                            id TEXT PRIMARY KEY,
+                            payload_msgpack BLOB NOT NULL
+                        )
+                        ",
+                        SQLITE_STORE_TABLE_NAME
+                    ),
+                    [],
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "Failed to initialize sqlite table {} in {}: {}",
+                        SQLITE_STORE_TABLE_NAME,
+                        store.db_path.display(),
+                        e
+                    )
+                });
+        }
 
         store
     }
 
-    pub async fn assume_initialized(db_path: impl Into<PathBuf>, max_connections: u32) -> Self {
+    pub async fn assume_initialized(db_path: impl Into<PathBuf>) -> Self {
         let db_path = db_path.into();
         assert!(
             db_path.exists(),
@@ -206,24 +230,11 @@ where
             SQLITE_STORE_TABLE_NAME
         );
 
-        let connect_options = Self::sqlite_connect_options(&db_path, false);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(max_connections)
-            .acquire_timeout(Duration::from_secs(SQLITE_POOL_ACQUIRE_TIMEOUT_SECS))
-            .connect_with(connect_options)
-            .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "Failed to open sqlite database {} for table {}: {}",
-                    db_path.display(),
-                    SQLITE_STORE_TABLE_NAME,
-                    e
-                )
-            });
+        let connection = Self::open_connection(&db_path, false).unwrap_or_else(|e| panic!("{}", e));
 
         let store = Self {
             db_path,
-            pool,
+            connection: Arc::new(std::sync::Mutex::new(connection)),
             key_marker: PhantomData,
             value_marker: PhantomData,
         };
@@ -237,10 +248,10 @@ where
         store
     }
 
-    pub async fn initialize_if_missing(db_path: impl Into<PathBuf>, max_connections: u32) -> Self {
+    pub async fn initialize_if_missing(db_path: impl Into<PathBuf>) -> Self {
         let db_path = db_path.into();
         if db_path.exists() {
-            let store = Self::assume_initialized(db_path, max_connections).await;
+            let store = Self::assume_initialized(db_path).await;
             assert!(
                 store.table_exists().await,
                 "Expected sqlite table {} to exist in {} when initializing-if-missing",
@@ -249,16 +260,18 @@ where
             );
             store
         } else {
-            Self::initialize(db_path, max_connections).await
+            Self::initialize(db_path).await
         }
     }
 
     pub async fn clear(&self) -> Result<(), String> {
         for attempt in 0..=SQLITE_BUSY_MAX_RETRIES {
-            match sqlx::query(&format!("DELETE FROM {}", SQLITE_STORE_TABLE_NAME))
-                .execute(&self.pool)
-                .await
-            {
+            let result = {
+                let connection = self.connection.lock().expect("sqlite mutex poisoned");
+                connection.execute(&format!("DELETE FROM {}", SQLITE_STORE_TABLE_NAME), [])
+            };
+
+            match result {
                 Ok(_) => return Ok(()),
                 Err(error)
                     if Self::is_sqlite_busy_or_locked(&error)
@@ -278,6 +291,7 @@ where
                 }
             }
         }
+
         Err(format!(
             "Failed to clear sqlite table {} in {} due to persistent sqlite lock",
             SQLITE_STORE_TABLE_NAME,
@@ -308,27 +322,30 @@ where
         };
 
         for attempt in 0..=max_retries {
-            match sqlx::query(&format!(
-                "
-                INSERT INTO {} (id, payload_msgpack)
-                VALUES (?1, ?2)
-                ON CONFLICT(id) DO UPDATE SET payload_msgpack = excluded.payload_msgpack
-                ",
-                SQLITE_STORE_TABLE_NAME
-            ))
-            .bind(&key_text)
-            .bind(&payload_msgpack)
-            .execute(&self.pool)
-            .await
-            {
+            let result = {
+                let connection = self.connection.lock().expect("sqlite mutex poisoned");
+                connection.execute(
+                    &format!(
+                        "
+                        INSERT INTO {} (id, payload_msgpack)
+                        VALUES (?1, ?2)
+                        ON CONFLICT(id) DO UPDATE SET payload_msgpack = excluded.payload_msgpack
+                        ",
+                        SQLITE_STORE_TABLE_NAME
+                    ),
+                    params![key_text, payload_msgpack],
+                )
+            };
+
+            match result {
                 Ok(_) => return Ok(()),
-                Err(error) if Self::is_retryable_write_error(&error) && attempt < max_retries => {
+                Err(error) if Self::is_sqlite_busy_or_locked(&error) && attempt < max_retries => {
                     tokio::time::sleep(Self::busy_retry_delay(attempt, base_delay_ms)).await;
                 }
                 Err(error) => {
                     return Err(format!(
                         "Failed to upsert sqlite payload for key {} in table {} at {} after {} retries: {}",
-                        key_text,
+                        key.to_key_text(),
                         SQLITE_STORE_TABLE_NAME,
                         self.db_path.display(),
                         attempt,
@@ -337,9 +354,10 @@ where
                 }
             }
         }
+
         Err(format!(
             "Failed to upsert sqlite payload for key {} in table {} at {} due to persistent sqlite lock",
-            key_text,
+            key.to_key_text(),
             SQLITE_STORE_TABLE_NAME,
             self.db_path.display(),
         ))
@@ -347,13 +365,19 @@ where
 
     pub async fn get(&self, key: K) -> Result<Option<V>, String> {
         let key_text = key.to_key_text();
-        let row = sqlx::query(&format!(
-            "SELECT payload_msgpack FROM {} WHERE id = ?1",
-            SQLITE_STORE_TABLE_NAME
-        ))
-        .bind(&key_text)
-        .fetch_optional(&self.pool)
-        .await
+        let payload_msgpack: Option<Vec<u8>> = {
+            let connection = self.connection.lock().expect("sqlite mutex poisoned");
+            connection
+                .query_row(
+                    &format!(
+                        "SELECT payload_msgpack FROM {} WHERE id = ?1",
+                        SQLITE_STORE_TABLE_NAME
+                    ),
+                    params![key_text],
+                    |row| row.get(0),
+                )
+                .optional()
+        }
         .map_err(|e| {
             format!(
                 "Failed to query key {} from table {} at {}: {}",
@@ -364,57 +388,62 @@ where
             )
         })?;
 
-        row.map(|row| {
-            let msgpack: Vec<u8> = row.try_get(0).map_err(|e| {
-                format!(
-                    "Failed to decode sqlite payload blob for key {} from table {} at {}: {}",
-                    key.to_key_text(),
-                    SQLITE_STORE_TABLE_NAME,
-                    self.db_path.display(),
-                    e
-                )
-            })?;
-            rmp_serde::from_slice::<V>(&msgpack).map_err(|e| {
-                format!(
-                    "Failed to deserialize sqlite payload for key {} from table {} at {}: {}",
-                    key.to_key_text(),
-                    SQLITE_STORE_TABLE_NAME,
-                    self.db_path.display(),
-                    e
-                )
+        payload_msgpack
+            .map(|msgpack| {
+                rmp_serde::from_slice::<V>(&msgpack).map_err(|e| {
+                    format!(
+                        "Failed to deserialize sqlite payload for key {} from table {} at {}: {}",
+                        key.to_key_text(),
+                        SQLITE_STORE_TABLE_NAME,
+                        self.db_path.display(),
+                        e
+                    )
+                })
             })
-        })
-        .transpose()
+            .transpose()
     }
 
     pub async fn get_keys(&self) -> Result<Vec<K>, String> {
-        let rows: Vec<sqlx::sqlite::SqliteRow> = sqlx::query(&format!(
-            "SELECT id FROM {} ORDER BY id ASC",
-            SQLITE_STORE_TABLE_NAME
-        ))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| {
-            format!(
-                "Failed to query keys from table {} in {}: {}",
-                SQLITE_STORE_TABLE_NAME,
-                self.db_path.display(),
-                e
-            )
-        })?;
+        let key_texts = {
+            let connection = self.connection.lock().expect("sqlite mutex poisoned");
+            let mut statement = connection
+                .prepare(&format!(
+                    "SELECT id FROM {} ORDER BY id ASC",
+                    SQLITE_STORE_TABLE_NAME
+                ))
+                .map_err(|e| {
+                    format!(
+                        "Failed to query keys from table {} in {}: {}",
+                        SQLITE_STORE_TABLE_NAME,
+                        self.db_path.display(),
+                        e
+                    )
+                })?;
 
-        rows.into_iter()
-            .map(|row| {
-                let key_text: String = row.try_get(0).map_err(|e| {
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| {
                     format!(
                         "Failed to decode key text from table {} in {}: {}",
                         SQLITE_STORE_TABLE_NAME,
                         self.db_path.display(),
                         e
                     )
-                })?;
-                K::from_key_text(&key_text)
-            })
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| {
+                    format!(
+                        "Failed to decode key text from table {} in {}: {}",
+                        SQLITE_STORE_TABLE_NAME,
+                        self.db_path.display(),
+                        e
+                    )
+                })?
+        };
+
+        key_texts
+            .into_iter()
+            .map(|key_text| K::from_key_text(&key_text))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| {
                 format!(
@@ -427,31 +456,46 @@ where
     }
 
     pub async fn load_all(&self) -> Result<Vec<V>, String> {
-        let rows: Vec<sqlx::sqlite::SqliteRow> = sqlx::query(&format!(
-            "SELECT payload_msgpack FROM {} ORDER BY id ASC",
-            SQLITE_STORE_TABLE_NAME
-        ))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| {
-            format!(
-                "Failed to execute scan query for table {} in {}: {}",
-                SQLITE_STORE_TABLE_NAME,
-                self.db_path.display(),
-                e
-            )
-        })?;
+        let payload_rows: Vec<Vec<u8>> = {
+            let connection = self.connection.lock().expect("sqlite mutex poisoned");
+            let mut statement = connection
+                .prepare(&format!(
+                    "SELECT payload_msgpack FROM {} ORDER BY id ASC",
+                    SQLITE_STORE_TABLE_NAME
+                ))
+                .map_err(|e| {
+                    format!(
+                        "Failed to execute scan query for table {} in {}: {}",
+                        SQLITE_STORE_TABLE_NAME,
+                        self.db_path.display(),
+                        e
+                    )
+                })?;
 
-        rows.into_iter()
-            .map(|row| {
-                let payload_msgpack: Vec<u8> = row.try_get(0).map_err(|e| {
+            statement
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                .map_err(|e| {
                     format!(
                         "Failed to decode row payload for table {} in {}: {}",
                         SQLITE_STORE_TABLE_NAME,
                         self.db_path.display(),
                         e
                     )
-                })?;
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| {
+                    format!(
+                        "Failed to decode row payload for table {} in {}: {}",
+                        SQLITE_STORE_TABLE_NAME,
+                        self.db_path.display(),
+                        e
+                    )
+                })?
+        };
+
+        payload_rows
+            .into_iter()
+            .map(|payload_msgpack| {
                 rmp_serde::from_slice::<V>(&payload_msgpack).map_err(|e| {
                     format!(
                         "Failed to deserialize row payload for table {} in {}: {}",
@@ -465,19 +509,25 @@ where
     }
 
     async fn table_exists(&self) -> bool {
-        let existing_table_name: Option<String> =
-            sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1")
-                .bind(SQLITE_STORE_TABLE_NAME)
-                .fetch_optional(&self.pool)
-                .await
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "Failed to query sqlite_master for table {} in {}: {}",
-                        SQLITE_STORE_TABLE_NAME,
-                        self.db_path.display(),
-                        e
-                    )
-                });
+        let existing_table_name: Option<String> = {
+            let connection = self.connection.lock().expect("sqlite mutex poisoned");
+            connection
+                .query_row(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![SQLITE_STORE_TABLE_NAME],
+                    |row| row.get(0),
+                )
+                .optional()
+        }
+        .unwrap_or_else(|e| {
+            panic!(
+                "Failed to query sqlite_master for table {} in {}: {}",
+                SQLITE_STORE_TABLE_NAME,
+                self.db_path.display(),
+                e
+            )
+        });
+
         existing_table_name.is_some()
     }
 }
