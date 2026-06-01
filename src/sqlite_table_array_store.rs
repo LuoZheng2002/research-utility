@@ -1,6 +1,12 @@
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::{Row, SqlitePool, sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions};
-use std::{marker::PhantomData, path::PathBuf};
+use std::{collections::HashSet, marker::PhantomData, path::PathBuf, sync::Arc, time::Duration};
+use tokio::sync::Mutex;
+
+const SQLITE_BUSY_MAX_RETRIES: usize = 12;
+const SQLITE_BUSY_BASE_DELAY_MS: u64 = 25;
+const SQLITE_BUSY_TIMEOUT_SECS: u64 = 30;
+const SQLITE_POOL_ACQUIRE_TIMEOUT_SECS: u64 = 300;
 
 pub trait SqliteTableArrayKey {
     fn to_table_key_text(&self) -> String;
@@ -49,6 +55,7 @@ impl SqliteTableArrayKey for &str {
 pub struct SqliteTableArrayStore<K, V> {
     db_path: PathBuf,
     pool: SqlitePool,
+    initialized_tables: Arc<Mutex<HashSet<String>>>,
     key_marker: PhantomData<K>,
     value_marker: PhantomData<V>,
 }
@@ -58,7 +65,50 @@ where
     K: SqliteTableArrayKey,
     V: Serialize + DeserializeOwned,
 {
+    fn sqlite_connect_options(db_path: &PathBuf, create_if_missing: bool) -> SqliteConnectOptions {
+        SqliteConnectOptions::new()
+            .filename(db_path)
+            .create_if_missing(create_if_missing)
+            .busy_timeout(Duration::from_secs(SQLITE_BUSY_TIMEOUT_SECS))
+            .pragma("journal_mode", "WAL")
+            .pragma("synchronous", "NORMAL")
+    }
+
+    fn is_sqlite_busy_or_locked(error: &sqlx::Error) -> bool {
+        let message = error.to_string().to_ascii_lowercase();
+        if message.contains("database is locked") || message.contains("database table is locked") {
+            return true;
+        }
+        let sqlx::Error::Database(database_error) = error else {
+            return false;
+        };
+        if let Some(code) = database_error.code() {
+            return code == "5" || code == "6";
+        }
+        false
+    }
+
+    fn is_pool_timeout(error: &sqlx::Error) -> bool {
+        matches!(error, sqlx::Error::PoolTimedOut)
+    }
+
+    fn is_retryable_write_error(error: &sqlx::Error) -> bool {
+        Self::is_sqlite_busy_or_locked(error) || Self::is_pool_timeout(error)
+    }
+
+    fn busy_retry_delay(attempt: usize, base_delay_ms: u64) -> Duration {
+        let shift = attempt.min(8);
+        Duration::from_millis(base_delay_ms * (1_u64 << shift))
+    }
+
     pub async fn new(db_path: impl Into<PathBuf>) -> Result<Self, String> {
+        Self::new_with_max_connections(db_path, 1).await
+    }
+
+    pub async fn new_with_max_connections(
+        db_path: impl Into<PathBuf>,
+        max_connections: u32,
+    ) -> Result<Self, String> {
         let db_path = db_path.into();
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -70,11 +120,10 @@ where
             })?;
         }
 
-        let connect_options = SqliteConnectOptions::new()
-            .filename(&db_path)
-            .create_if_missing(true);
+        let connect_options = Self::sqlite_connect_options(&db_path, true);
         let pool = SqlitePoolOptions::new()
-            .max_connections(1)
+            .max_connections(max_connections)
+            .acquire_timeout(Duration::from_secs(SQLITE_POOL_ACQUIRE_TIMEOUT_SECS))
             .connect_with(connect_options)
             .await
             .map_err(|e| {
@@ -88,6 +137,7 @@ where
         Ok(Self {
             db_path,
             pool,
+            initialized_tables: Arc::new(Mutex::new(HashSet::new())),
             key_marker: PhantomData,
             value_marker: PhantomData,
         })
@@ -96,6 +146,24 @@ where
     pub async fn append(&self, table_key: K, value: &V) -> Result<(), String> {
         let table_name = Self::table_name(table_key.to_table_key_text());
         self.initialize_table(&table_name).await?;
+        let next_row_index = self.next_row_index(&table_name).await?;
+        self.append_payload_at_index(&table_name, next_row_index, value)
+            .await
+    }
+
+    pub async fn append_at(&self, table_key: K, row_index: usize, value: &V) -> Result<(), String> {
+        let table_name = Self::table_name(table_key.to_table_key_text());
+        self.initialize_table(&table_name).await?;
+        self.append_payload_at_index(&table_name, row_index as i64, value)
+            .await
+    }
+
+    async fn append_payload_at_index(
+        &self,
+        table_name: &str,
+        row_index: i64,
+        value: &V,
+    ) -> Result<(), String> {
         let payload_msgpack = rmp_serde::to_vec_named(value).map_err(|e| {
             format!(
                 "Failed to serialize sqlite payload for table {} in {}: {}",
@@ -104,28 +172,133 @@ where
                 e
             )
         })?;
+        for attempt in 0..=SQLITE_BUSY_MAX_RETRIES {
+            let result = sqlx::query(&format!(
+                "
+                INSERT INTO {} (row_index, payload_msgpack)
+                VALUES (?1, ?2)
+                ON CONFLICT(row_index) DO NOTHING
+                ",
+                table_name
+            ))
+            .bind(row_index)
+            .bind(&payload_msgpack)
+            .execute(&self.pool)
+            .await;
+            match result {
+                Ok(query_result) => {
+                    if query_result.rows_affected() > 0 {
+                        return Ok(());
+                    }
+                    let existing_payload = self
+                        .load_payload_at_index(table_name, row_index)
+                        .await?
+                        .ok_or_else(|| {
+                            format!(
+                                "Conflict insert at row_index {} for table {} in {} returned no row",
+                                row_index,
+                                table_name,
+                                self.db_path.display()
+                            )
+                        })?;
+                    if existing_payload == payload_msgpack {
+                        return Ok(());
+                    }
+                    return Err(format!(
+                        "Conflicting payload at row_index {} for table {} in {}",
+                        row_index,
+                        table_name,
+                        self.db_path.display()
+                    ));
+                }
+                Err(error)
+                    if Self::is_retryable_write_error(&error) && attempt < SQLITE_BUSY_MAX_RETRIES =>
+                {
+                    tokio::time::sleep(Self::busy_retry_delay(attempt, SQLITE_BUSY_BASE_DELAY_MS))
+                        .await;
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "Failed to append sqlite payload into table {} at {} after {} retries: {}",
+                        table_name,
+                        self.db_path.display(),
+                        attempt,
+                        error
+                    ));
+                }
+            }
+        }
+        Err(format!(
+            "Failed to append sqlite payload into table {} at {} due to persistent sqlite lock",
+            table_name,
+            self.db_path.display()
+        ))
+    }
+
+    async fn load_payload_at_index(
+        &self,
+        table_name: &str,
+        row_index: i64,
+    ) -> Result<Option<Vec<u8>>, String> {
         sqlx::query(&format!(
             "
-            INSERT INTO {} (payload_msgpack)
-            VALUES (?1)
+            SELECT payload_msgpack
+            FROM {}
+            WHERE row_index = ?1
             ",
             table_name
         ))
-        .bind(payload_msgpack)
-        .execute(&self.pool)
+        .bind(row_index)
+        .fetch_optional(&self.pool)
         .await
         .map_err(|e| {
             format!(
-                "Failed to append sqlite payload into table {} at {}: {}",
+                "Failed to fetch row_index {} from table {} in {}: {}",
+                row_index,
+                table_name,
+                self.db_path.display(),
+                e
+            )
+        })?
+        .map(|row| {
+            row.try_get::<Vec<u8>, _>(0).map_err(|e| {
+                format!(
+                    "Failed to decode row payload for row_index {} in table {} in {}: {}",
+                    row_index,
+                    table_name,
+                    self.db_path.display(),
+                    e
+                )
+            })
+        })
+        .transpose()
+    }
+
+    async fn next_row_index(&self, table_name: &str) -> Result<i64, String> {
+        let max_row_index: Option<i64> = sqlx::query_scalar(&format!(
+            "SELECT MAX(row_index) FROM {}",
+            table_name
+        ))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            format!(
+                "Failed to query max row_index for table {} in {}: {}",
                 table_name,
                 self.db_path.display(),
                 e
             )
         })?;
-        Ok(())
+        Ok(max_row_index.map_or(0, |value| value + 1))
     }
 
     pub async fn load_table(&self, table_key: K) -> Result<Vec<V>, String> {
+        self.load_table_with_indices(table_key)
+            .await
+            .map(|rows| rows.into_iter().map(|(_, value)| value).collect())
+    }
+
+    pub async fn load_table_with_indices(&self, table_key: K) -> Result<Vec<(usize, V)>, String> {
         let table_name = Self::table_name(table_key.to_table_key_text());
         if !self.table_exists_with_name(&table_name).await? {
             return Ok(Vec::new());
@@ -133,9 +306,9 @@ where
 
         let rows = sqlx::query(&format!(
             "
-            SELECT payload_msgpack
+            SELECT row_index, payload_msgpack
             FROM {}
-            ORDER BY id ASC
+            ORDER BY row_index ASC
             ",
             table_name
         ))
@@ -152,7 +325,23 @@ where
 
         rows.into_iter()
             .map(|row| {
-                let payload_msgpack: Vec<u8> = row.try_get(0).map_err(|e| {
+                let row_index: i64 = row.try_get(0).map_err(|e| {
+                    format!(
+                        "Failed to decode row index for table {} in {}: {}",
+                        table_name,
+                        self.db_path.display(),
+                        e
+                    )
+                })?;
+                if row_index < 0 {
+                    return Err(format!(
+                        "Negative row index {} found in table {} in {}",
+                        row_index,
+                        table_name,
+                        self.db_path.display()
+                    ));
+                }
+                let payload_msgpack: Vec<u8> = row.try_get(1).map_err(|e| {
                     format!(
                         "Failed to decode row payload for table {} in {}: {}",
                         table_name,
@@ -160,14 +349,15 @@ where
                         e
                     )
                 })?;
-                rmp_serde::from_slice(&payload_msgpack).map_err(|e| {
+                let value = rmp_serde::from_slice(&payload_msgpack).map_err(|e| {
                     format!(
                         "Failed to deserialize row payload for table {} in {}: {}",
                         table_name,
                         self.db_path.display(),
                         e
                     )
-                })
+                })?;
+                Ok((row_index as usize, value))
             })
             .collect()
     }
@@ -204,6 +394,7 @@ where
                     e
                 )
             })?;
+        self.initialized_tables.lock().await.remove(&table_name);
         Ok(())
     }
 
@@ -213,10 +404,17 @@ where
     }
 
     async fn initialize_table(&self, table_name: &str) -> Result<(), String> {
+        {
+            if self.initialized_tables.lock().await.contains(table_name) {
+                return Ok(());
+            }
+        }
         sqlx::query(&format!(
             "
             CREATE TABLE IF NOT EXISTS {} (
                 id INTEGER PRIMARY KEY,
+                row_index INTEGER NOT NULL,
+                UNIQUE(row_index),
                 payload_msgpack BLOB NOT NULL
             )
             ",
@@ -232,6 +430,10 @@ where
                 e
             )
         })?;
+        self.initialized_tables
+            .lock()
+            .await
+            .insert(table_name.to_string());
         Ok(())
     }
 
