@@ -413,8 +413,7 @@ where
             "
             CREATE TABLE IF NOT EXISTS {} (
                 id INTEGER PRIMARY KEY,
-                row_index INTEGER NOT NULL,
-                UNIQUE(row_index),
+                row_index INTEGER NOT NULL UNIQUE,
                 payload_msgpack BLOB NOT NULL
             )
             ",
