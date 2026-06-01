@@ -25,7 +25,7 @@ use crate::message::{MyLogMessage, Severity};
 
 pub const PROGRESS_SCREEN_KEY_ORDER: &[&str] = &["status"];
 const MAX_LOG_LINES: usize = 100;
-const DEFAULT_REDRAW_INTERVAL: Duration = Duration::from_millis(100);
+const DEFAULT_REDRAW_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_PERSIST_EXIT_HINT: &str = "All tasks are done.";
 const PRESS_Q_TO_EXIT_HINT: &str = " Press Q to exit.";
 
