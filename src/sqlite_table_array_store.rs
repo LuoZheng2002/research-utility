@@ -52,7 +52,7 @@ impl SqliteTableArrayKey for &str {
 /// - This keeps table names deterministic and SQL-identifier-safe.
 pub struct SqliteTableArrayStore<K, V> {
     db_path: PathBuf,
-    connection: std::sync::Mutex<Connection>,
+    connection: parking_lot::Mutex<Connection>,
     initialized_tables: tokio::sync::Mutex<HashSet<String>>,
     key_marker: PhantomData<K>,
     value_marker: PhantomData<V>,
@@ -145,7 +145,7 @@ where
 
         Ok(Self {
             db_path,
-            connection: std::sync::Mutex::new(connection),
+            connection: parking_lot::Mutex::new(connection),
             initialized_tables: tokio::sync::Mutex::new(HashSet::new()),
             key_marker: PhantomData,
             value_marker: PhantomData,
@@ -184,7 +184,7 @@ where
 
         for attempt in 0..=SQLITE_BUSY_MAX_RETRIES {
             let result = {
-                let connection = self.connection.lock().expect("sqlite mutex poisoned");
+                let connection = self.connection.lock();
                 connection.execute(
                     &format!(
                         "
@@ -257,8 +257,7 @@ where
     ) -> Result<Option<Vec<u8>>, String> {
         self.connection
             .lock()
-            .expect("sqlite mutex poisoned")
-            .query_row(
+                .query_row(
                 &format!(
                     "
                     SELECT payload_msgpack
@@ -286,7 +285,6 @@ where
         let max_row_index: Option<i64> = self
             .connection
             .lock()
-            .expect("sqlite mutex poisoned")
             .query_row(
                 &format!("SELECT MAX(row_index) FROM {}", table_name),
                 [],
@@ -316,7 +314,7 @@ where
         }
 
         let rows: Vec<(i64, Vec<u8>)> = {
-            let connection = self.connection.lock().expect("sqlite mutex poisoned");
+            let connection = self.connection.lock();
             let mut statement = connection
                 .prepare(&format!(
                     "
@@ -390,7 +388,6 @@ where
         }
         self.connection
             .lock()
-            .expect("sqlite mutex poisoned")
             .execute(&format!("DELETE FROM {}", table_name), [])
             .map_err(|e| {
                 format!(
@@ -407,7 +404,6 @@ where
         let table_name = Self::table_name(table_key.to_table_key_text());
         self.connection
             .lock()
-            .expect("sqlite mutex poisoned")
             .execute(&format!("DROP TABLE IF EXISTS {}", table_name), [])
             .map_err(|e| {
                 format!(
@@ -435,7 +431,6 @@ where
 
         self.connection
             .lock()
-            .expect("sqlite mutex poisoned")
             .execute(
                 &format!(
                     "
@@ -469,7 +464,6 @@ where
         let existing_table_name: Option<String> = self
             .connection
             .lock()
-            .expect("sqlite mutex poisoned")
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
                 params![table_name],

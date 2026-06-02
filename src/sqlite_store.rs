@@ -76,7 +76,7 @@ impl SqliteStoreKey for String {
 #[derive(Debug)]
 pub struct SqliteStore<K, V> {
     db_path: PathBuf,
-    connection: Arc<std::sync::Mutex<Connection>>,
+    connection: Arc<parking_lot::Mutex<Connection>>,
     key_marker: PhantomData<K>,
     value_marker: PhantomData<V>,
 }
@@ -188,13 +188,13 @@ where
 
         let store = Self {
             db_path,
-            connection: Arc::new(std::sync::Mutex::new(connection)),
+            connection: Arc::new(parking_lot::Mutex::new(connection)),
             key_marker: PhantomData,
             value_marker: PhantomData,
         };
 
         {
-            let connection = store.connection.lock().expect("sqlite mutex poisoned");
+            let connection = store.connection.lock();
             connection
                 .execute(
                     &format!(
@@ -234,7 +234,7 @@ where
 
         let store = Self {
             db_path,
-            connection: Arc::new(std::sync::Mutex::new(connection)),
+            connection: Arc::new(parking_lot::Mutex::new(connection)),
             key_marker: PhantomData,
             value_marker: PhantomData,
         };
@@ -267,7 +267,7 @@ where
     pub async fn clear(&self) -> Result<(), String> {
         for attempt in 0..=SQLITE_BUSY_MAX_RETRIES {
             let result = {
-                let connection = self.connection.lock().expect("sqlite mutex poisoned");
+                let connection = self.connection.lock();
                 connection.execute(&format!("DELETE FROM {}", SQLITE_STORE_TABLE_NAME), [])
             };
 
@@ -323,7 +323,7 @@ where
 
         for attempt in 0..=max_retries {
             let result = {
-                let connection = self.connection.lock().expect("sqlite mutex poisoned");
+                let connection = self.connection.lock();
                 connection.execute(
                     &format!(
                         "
@@ -366,7 +366,7 @@ where
     pub async fn get(&self, key: K) -> Result<Option<V>, String> {
         let key_text = key.to_key_text();
         let payload_msgpack: Option<Vec<u8>> = {
-            let connection = self.connection.lock().expect("sqlite mutex poisoned");
+            let connection = self.connection.lock();
             connection
                 .query_row(
                     &format!(
@@ -405,7 +405,7 @@ where
 
     pub async fn get_keys(&self) -> Result<Vec<K>, String> {
         let key_texts = {
-            let connection = self.connection.lock().expect("sqlite mutex poisoned");
+            let connection = self.connection.lock();
             let mut statement = connection
                 .prepare(&format!(
                     "SELECT id FROM {} ORDER BY id ASC",
@@ -457,7 +457,7 @@ where
 
     pub async fn load_all(&self) -> Result<Vec<V>, String> {
         let payload_rows: Vec<Vec<u8>> = {
-            let connection = self.connection.lock().expect("sqlite mutex poisoned");
+            let connection = self.connection.lock();
             let mut statement = connection
                 .prepare(&format!(
                     "SELECT payload_msgpack FROM {} ORDER BY id ASC",
@@ -510,7 +510,7 @@ where
 
     async fn table_exists(&self) -> bool {
         let existing_table_name: Option<String> = {
-            let connection = self.connection.lock().expect("sqlite mutex poisoned");
+            let connection = self.connection.lock();
             connection
                 .query_row(
                     "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",

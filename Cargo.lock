@@ -1180,6 +1180,7 @@ dependencies = [
  "base64",
  "blake3",
  "crossterm",
+ "parking_lot",
  "ratatui",
  "rmp-serde",
  "rusqlite",

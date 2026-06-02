@@ -46,14 +46,15 @@ struct ProgressScreenRuntime {
     shutdown_tx: Option<oneshot::Sender<()>>,
 }
 
-static PROGRESS_SCREEN_RUNTIME: OnceLock<std::sync::Mutex<ProgressScreenRuntime>> = OnceLock::new();
+static PROGRESS_SCREEN_RUNTIME: OnceLock<parking_lot::Mutex<ProgressScreenRuntime>> =
+    OnceLock::new();
 
-static PERSISTENT_EXIT_HINT: LazyLock<std::sync::Mutex<String>> =
-    LazyLock::new(|| std::sync::Mutex::new(DEFAULT_PERSIST_EXIT_HINT.to_string()));
+static PERSISTENT_EXIT_HINT: LazyLock<parking_lot::Mutex<String>> =
+    LazyLock::new(|| parking_lot::Mutex::new(DEFAULT_PERSIST_EXIT_HINT.to_string()));
 
-fn runtime_state() -> &'static std::sync::Mutex<ProgressScreenRuntime> {
+fn runtime_state() -> &'static parking_lot::Mutex<ProgressScreenRuntime> {
     PROGRESS_SCREEN_RUNTIME.get_or_init(|| {
-        std::sync::Mutex::new(ProgressScreenRuntime {
+        parking_lot::Mutex::new(ProgressScreenRuntime {
             join_handle: None,
             shutdown_tx: None,
         })
@@ -67,8 +68,7 @@ impl ProgressScreen {
         log_file: Option<String>,
     ) -> io::Result<()> {
         let mut runtime = runtime_state()
-            .lock()
-            .expect("progress screen runtime mutex poisoned");
+            .lock();
         if runtime.join_handle.is_some() {
             return Ok(());
         }
@@ -99,8 +99,7 @@ impl ProgressScreen {
     pub async fn shutdown() -> io::Result<()> {
         let (shutdown_tx, join_handle) = {
             let mut runtime = runtime_state()
-                .lock()
-                .expect("progress screen runtime mutex poisoned");
+                .lock();
             (runtime.shutdown_tx.take(), runtime.join_handle.take())
         };
 
@@ -123,8 +122,7 @@ impl ProgressScreen {
     }
     pub fn set_persist_exit_hint(hint: impl Into<String>) {
         let mut guard = PERSISTENT_EXIT_HINT
-            .lock()
-            .expect("persistent exit hint mutex poisoned");
+            .lock();
         *guard = hint.into();
     }
 
@@ -466,7 +464,7 @@ fn draw(
 
         if show_persist_exit_hint {
             let hint =
-                Paragraph::new(PERSISTENT_EXIT_HINT.lock().unwrap().clone() + PRESS_Q_TO_EXIT_HINT)
+                Paragraph::new(PERSISTENT_EXIT_HINT.lock().clone() + PRESS_Q_TO_EXIT_HINT)
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
