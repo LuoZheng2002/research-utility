@@ -9,7 +9,7 @@ use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 
 use crate::message::TuiMessage;
 
-pub const DEFAULT_PROGRESS_SCREEN_TCP_ADDR: &str = "127.0.0.1:7878";
+pub const DEFAULT_PROGRESS_SCREEN_TCP_ADDR: &str = "0.0.0.0:7878";
 pub const PROGRESS_SCREEN_TCP_ADDR_ENV: &str = "RESEARCH_UTILITY_PROGRESS_TUI_ADDR";
 
 const MAX_WIRE_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
