@@ -36,6 +36,7 @@ pub enum TuiMessage {
     DeleteWorkerBar {
         worker_name: String,
     },
+    ExitHint(String),
 }
 
 impl TuiMessage {
@@ -60,6 +61,7 @@ impl TuiMessage {
             TuiMessage::DeleteWorkerBar { worker_name } => {
                 format!("Delete progress bar for worker {worker_name}")
             }
+            TuiMessage::ExitHint(hint) => format!("EXIT HINT: {hint}"),
         }
     }
 }

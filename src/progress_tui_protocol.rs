@@ -24,6 +24,7 @@ pub struct ProgressGaugeState {
 pub struct ProgressStats {
     pub state: String,
     pub window_name: String,
+    pub exit_hint: String,
     pub key_values: HashMap<String, String>,
     pub worker_progress: BTreeMap<String, ProgressGaugeState>,
     pub master_progress: ProgressGaugeState,
@@ -34,6 +35,7 @@ impl Default for ProgressStats {
         Self {
             state: String::new(),
             window_name: "Progress Screen".to_string(),
+            exit_hint: "Server disconnected. Ctrl+C to exit.".to_string(),
             key_values: HashMap::new(),
             worker_progress: BTreeMap::new(),
             master_progress: ProgressGaugeState {
@@ -88,6 +90,9 @@ impl ProgressStats {
             }
             TuiMessage::DeleteWorkerBar { worker_name } => {
                 self.worker_progress.remove(worker_name);
+            }
+            TuiMessage::ExitHint(hint) => {
+                self.exit_hint = hint.clone();
             }
         }
     }

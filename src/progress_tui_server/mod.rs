@@ -182,6 +182,10 @@ pub fn delete_worker_progress_bar(worker_name: impl Into<String>) {
     });
 }
 
+pub fn log_exit_hint(hint: impl Into<String>) {
+    log_message(TuiMessage::ExitHint(hint.into()));
+}
+
 async fn run(
     config: RunConfig,
     listener: TcpListener,

@@ -29,7 +29,7 @@ use crate::progress_tui_protocol::{
 const WINDOW_TITLE: &str = "Progress Screen";
 const MAX_LOG_LINES: usize = 100;
 const REDRAW_INTERVAL: Duration = Duration::from_millis(100);
-const SERVER_DISCONNECTED_HINT: &str = "Server disconnected. Ctrl+C to exit.";
+const DEFAULT_SERVER_DISCONNECTED_HINT: &str = "Server disconnected. Ctrl+C to exit.";
 const KEY_ORDER: &[&str] = &["status"];
 
 pub async fn run(addr: String) -> io::Result<()> {
@@ -113,6 +113,7 @@ pub async fn run(addr: String) -> io::Result<()> {
 struct ProgressScreenState {
     state_text: String,
     window_name: String,
+    exit_hint: String,
     key_values: HashMap<String, String>,
     stats_scroll_from_bottom: usize,
     stats_viewport_height: usize,
@@ -136,6 +137,7 @@ impl ProgressScreenState {
         Self {
             state_text: String::new(),
             window_name: WINDOW_TITLE.to_string(),
+            exit_hint: DEFAULT_SERVER_DISCONNECTED_HINT.to_string(),
             key_values: HashMap::new(),
             stats_scroll_from_bottom: 0,
             stats_viewport_height: 1,
@@ -156,6 +158,7 @@ impl ProgressScreenState {
     fn apply_snapshot(&mut self, snapshot: ProgressStats) {
         self.state_text = snapshot.state;
         self.window_name = snapshot.window_name;
+        self.exit_hint = snapshot.exit_hint;
         self.key_values = snapshot.key_values;
         self.worker_progress = snapshot.worker_progress;
         self.master_progress = snapshot.master_progress;
@@ -198,6 +201,9 @@ impl ProgressScreenState {
             }
             TuiMessage::DeleteWorkerBar { worker_name } => {
                 self.worker_progress.remove(&worker_name);
+            }
+            TuiMessage::ExitHint(hint) => {
+                self.exit_hint = hint;
             }
         }
     }
@@ -455,7 +461,7 @@ fn draw(
         frame.render_widget(master_gauge, main_layout[2]);
 
         if server_disconnected {
-            let hint = Paragraph::new(SERVER_DISCONNECTED_HINT)
+            let hint = Paragraph::new(state.exit_hint.as_str())
                 .block(Block::default().borders(Borders::ALL).title("Disconnected"));
             frame.render_widget(hint, main_layout[3]);
         }
