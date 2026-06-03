@@ -8,11 +8,20 @@ const SQLITE_BUSY_TIMEOUT_SECS: u64 = 30;
 
 pub trait SqliteTableArrayKey {
     fn to_table_key_text(&self) -> String;
+    fn from_table_key_text(table_key_text: &str) -> Result<Self, String>
+    where
+        Self: Sized;
 }
 
 impl SqliteTableArrayKey for usize {
     fn to_table_key_text(&self) -> String {
         self.to_string()
+    }
+
+    fn from_table_key_text(table_key_text: &str) -> Result<Self, String> {
+        table_key_text
+            .parse::<usize>()
+            .map_err(|e| format!("Failed to parse usize key '{}': {}", table_key_text, e))
     }
 }
 
@@ -20,17 +29,31 @@ impl SqliteTableArrayKey for i64 {
     fn to_table_key_text(&self) -> String {
         self.to_string()
     }
+
+    fn from_table_key_text(table_key_text: &str) -> Result<Self, String> {
+        table_key_text
+            .parse::<i64>()
+            .map_err(|e| format!("Failed to parse i64 key '{}': {}", table_key_text, e))
+    }
 }
 
 impl SqliteTableArrayKey for String {
     fn to_table_key_text(&self) -> String {
         self.clone()
     }
+
+    fn from_table_key_text(table_key_text: &str) -> Result<Self, String> {
+        Ok(table_key_text.to_string())
+    }
 }
 
 impl SqliteTableArrayKey for &str {
     fn to_table_key_text(&self) -> String {
         self.to_string()
+    }
+
+    fn from_table_key_text(_table_key_text: &str) -> Result<Self, String> {
+        Err("Cannot decode table key text into &str; use String instead".to_string())
     }
 }
 
@@ -62,14 +85,16 @@ where
     K: SqliteTableArrayKey,
     V: Serialize + DeserializeOwned,
 {
-    fn open_connection(db_path: &PathBuf) -> Result<Connection, String> {
-        let connection = Connection::open_with_flags(
-            db_path,
+    fn open_connection(db_path: &PathBuf, create_if_missing: bool) -> Result<Connection, String> {
+        let flags = if create_if_missing {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
                 | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
-                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        )
-        .map_err(|e| {
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+        } else {
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI
+        };
+
+        let connection = Connection::open_with_flags(db_path, flags).map_err(|e| {
             format!(
                 "Failed to open sqlite database {}: {}",
                 db_path.display(),
@@ -129,7 +154,39 @@ where
     }
 
     fn table_name(table_key_text: &str) -> String {
+        let table_name = Self::table_name_from_key_text_unchecked(table_key_text);
+        let decoded_table_key_text = Self::table_key_text_from_table_name(&table_name)
+            .expect("failed to decode internally encoded sqlite table key text");
+        assert_eq!(
+            decoded_table_key_text, table_key_text,
+            "sqlite table key encoding/decoding must be inverse"
+        );
+        table_name
+    }
+
+    fn table_name_from_key_text_unchecked(table_key_text: &str) -> String {
         format!("table_{}", hex_encode(table_key_text.as_bytes()))
+    }
+
+    fn table_key_text_from_table_name(table_name: &str) -> Result<String, String> {
+        let Some(hex_encoded_key) = table_name.strip_prefix("table_") else {
+            return Err(format!("Unexpected table name format '{}'", table_name));
+        };
+        let key_bytes = hex_decode(hex_encoded_key)
+            .map_err(|e| format!("Failed to decode key from table '{}': {}", table_name, e))?;
+        let key_text = String::from_utf8(key_bytes).map_err(|e| {
+            format!(
+                "Failed to decode UTF-8 key from table '{}': {}",
+                table_name, e
+            )
+        })?;
+
+        let reencoded_table_name = Self::table_name_from_key_text_unchecked(&key_text);
+        assert_eq!(
+            reencoded_table_name, table_name,
+            "sqlite table key decoding/encoding must be inverse"
+        );
+        Ok(key_text)
     }
 
     fn initialize_table(
@@ -309,24 +366,60 @@ where
         ))
     }
 
-    pub fn new(db_path: impl Into<PathBuf>) -> Result<Self, String> {
+    pub fn initialize(db_path: impl Into<PathBuf>) -> Self {
         let db_path = db_path.into();
+        assert!(
+            !db_path.exists(),
+            "Expected sqlite database {} to not exist when initializing sqlite table array store",
+            db_path.display()
+        );
         if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                format!(
+            std::fs::create_dir_all(parent).unwrap_or_else(|e| {
+                panic!(
                     "Failed to create parent directory for sqlite database {}: {}",
                     db_path.display(),
                     e
                 )
-            })?;
+            });
         }
-        let connection = Self::open_connection(&db_path)?;
-        Ok(Self {
+
+        let connection = Self::open_connection(&db_path, true).unwrap_or_else(|e| panic!("{}", e));
+        Self {
             db_path,
             connection,
             key_marker: PhantomData,
             value_marker: PhantomData,
-        })
+        }
+    }
+
+    pub fn assume_initialized(db_path: impl Into<PathBuf>) -> Self {
+        let db_path = db_path.into();
+        assert!(
+            db_path.exists(),
+            "Expected sqlite database {} to exist before assuming sqlite table array store is initialized",
+            db_path.display()
+        );
+
+        let connection = Self::open_connection(&db_path, false).unwrap_or_else(|e| panic!("{}", e));
+        Self {
+            db_path,
+            connection,
+            key_marker: PhantomData,
+            value_marker: PhantomData,
+        }
+    }
+
+    pub fn initialize_if_missing(db_path: impl Into<PathBuf>) -> Self {
+        let db_path = db_path.into();
+        if db_path.exists() {
+            Self::assume_initialized(db_path)
+        } else {
+            Self::initialize(db_path)
+        }
+    }
+
+    pub fn new(db_path: impl Into<PathBuf>) -> Result<Self, String> {
+        Ok(Self::initialize_if_missing(db_path))
     }
 
     pub fn append(&self, table_key: K, value: &V) -> Result<(), String> {
@@ -358,9 +451,50 @@ where
         self.append_payload(&table_name, row_index as i64, payload_msgpack)
     }
 
-    pub fn load_table(&self, table_key: K) -> Result<Vec<V>, String> {
+    pub fn load_table_sorted(&self, table_key: K) -> Result<Vec<V>, String> {
+        self.load_table_with_indices(table_key).map(|mut rows| {
+            rows.sort_by_key(|(row_index, _)| *row_index);
+            rows.into_iter().map(|(_, value)| value).collect()
+        })
+    }
+
+    pub fn load_or_init_table_sorted<F>(
+        &self,
+        table_key: K,
+        initialize_rows: F,
+    ) -> Result<Vec<V>, String>
+    where
+        F: FnOnce() -> Vec<(usize, V)>,
+    {
+        let table_key_text = table_key.to_table_key_text();
+        let table_name = Self::table_name(&table_key_text);
+
+        if !Self::table_exists_with_name(&self.connection, &table_name, &self.db_path)? {
+            Self::initialize_table(&self.connection, &table_name, &self.db_path)?;
+            for (row_index, value) in initialize_rows() {
+                let row_index = i64::try_from(row_index).map_err(|_| {
+                    format!(
+                        "Row index is too large for table {} in {}",
+                        table_name,
+                        self.db_path.display()
+                    )
+                })?;
+                let payload_msgpack = rmp_serde::to_vec_named(&value).map_err(|e| {
+                    format!(
+                        "Failed to serialize sqlite payload in {}: {}",
+                        self.db_path.display(),
+                        e
+                    )
+                })?;
+                self.append_payload(&table_name, row_index, payload_msgpack)?;
+            }
+        }
+
         self.load_table_with_indices(table_key)
-            .map(|rows| rows.into_iter().map(|(_, value)| value).collect())
+            .map(|mut rows| {
+                rows.sort_by_key(|(row_index, _)| *row_index);
+                rows.into_iter().map(|(_, value)| value).collect()
+            })
     }
 
     pub fn load_table_with_indices(&self, table_key: K) -> Result<Vec<(usize, V)>, String> {
@@ -410,7 +544,8 @@ where
                     e
                 )
             })?;
-        rows.into_iter()
+        let mut decoded_rows = rows
+            .into_iter()
             .map(|(row_index, payload_msgpack)| {
                 if row_index < 0 {
                     return Err(format!(
@@ -429,7 +564,9 @@ where
                 })?;
                 Ok((row_index as usize, value))
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        decoded_rows.sort_by_key(|(row_index, _)| *row_index);
+        Ok(decoded_rows)
     }
 
     pub fn clear_table(&self, table_key: K) -> Result<(), String> {
@@ -472,6 +609,66 @@ where
         let table_name = Self::table_name(&table_key_text);
         Self::table_exists_with_name(&self.connection, &table_name, &self.db_path)
     }
+
+    pub fn get_keys(&self) -> Result<Vec<K>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table' AND name LIKE 'table_%'
+                ORDER BY name ASC
+                ",
+            )
+            .map_err(|e| {
+                format!(
+                    "Failed to prepare key scan query in {}: {}",
+                    self.db_path.display(),
+                    e
+                )
+            })?;
+        let table_names: Vec<String> = statement
+            .query_map([], |row| row.get(0))
+            .map_err(|e| {
+                format!(
+                    "Failed to scan sqlite table names in {}: {}",
+                    self.db_path.display(),
+                    e
+                )
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                format!(
+                    "Failed to decode sqlite table names in {}: {}",
+                    self.db_path.display(),
+                    e
+                )
+            })?;
+
+        table_names
+            .into_iter()
+            .map(|table_name| {
+                let key_text = Self::table_key_text_from_table_name(&table_name).map_err(|e| {
+                    format!(
+                        "Failed to decode key from table '{}' in {}: {}",
+                        table_name,
+                        self.db_path.display(),
+                        e
+                    )
+                })?;
+                K::from_table_key_text(&key_text).map_err(|e| {
+                    format!(
+                        "Failed to parse key '{}' from table '{}' in {}: {}",
+                        key_text,
+                        table_name,
+                        self.db_path.display(),
+                        e
+                    )
+                })
+            })
+            .collect()
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -482,4 +679,41 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+fn hex_decode(hex_str: &str) -> Result<Vec<u8>, String> {
+    if !hex_str.len().is_multiple_of(2) {
+        return Err(format!("hex string has odd length: {}", hex_str.len()));
+    }
+    let mut output = Vec::with_capacity(hex_str.len() / 2);
+    let bytes = hex_str.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let high = hex_nibble(bytes[index]).ok_or_else(|| {
+            format!(
+                "invalid hex character '{}' at index {}",
+                bytes[index] as char,
+                index
+            )
+        })?;
+        let low = hex_nibble(bytes[index + 1]).ok_or_else(|| {
+            format!(
+                "invalid hex character '{}' at index {}",
+                bytes[index + 1] as char,
+                index + 1
+            )
+        })?;
+        output.push((high << 4) | low);
+        index += 2;
+    }
+    Ok(output)
+}
+
+fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
 }

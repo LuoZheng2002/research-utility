@@ -368,6 +368,142 @@ where
             .transpose()
     }
 
+    pub fn get_or_init<F>(
+        &self,
+        key: K,
+        initialize_value: F,
+        retry_config: Option<SqliteBusyRetryConfig>,
+    ) -> Result<V, String>
+    where
+        F: FnOnce() -> V,
+    {
+        let key_text = key.to_key_text();
+        let payload_msgpack = self
+            .connection
+            .query_row(
+                &format!(
+                    "SELECT payload_msgpack FROM {} WHERE id = ?1",
+                    SQLITE_STORE_TABLE_NAME
+                ),
+                params![&key_text],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(|e| {
+                format!(
+                    "Failed to query key {} from table {} at {}: {}",
+                    key_text,
+                    SQLITE_STORE_TABLE_NAME,
+                    self.db_path.display(),
+                    e
+                )
+            })?;
+
+        if let Some(payload_msgpack) = payload_msgpack {
+            return rmp_serde::from_slice::<V>(&payload_msgpack).map_err(|e| {
+                format!(
+                    "Failed to deserialize sqlite payload for table {} in {}: {}",
+                    SQLITE_STORE_TABLE_NAME,
+                    self.db_path.display(),
+                    e
+                )
+            });
+        }
+
+        let initial_value = initialize_value();
+        let initial_payload_msgpack = rmp_serde::to_vec_named(&initial_value).map_err(|e| {
+            format!(
+                "Failed to serialize sqlite payload for table {} in {}: {}",
+                SQLITE_STORE_TABLE_NAME,
+                self.db_path.display(),
+                e
+            )
+        })?;
+
+        let (max_retries, base_delay_ms) = if let Some(retry_config) = retry_config {
+            (retry_config.max_retries, retry_config.base_delay_ms)
+        } else {
+            (0, SQLITE_BUSY_BASE_DELAY_MS)
+        };
+        for attempt in 0..=max_retries {
+            let insert_result = self.connection.execute(
+                &format!(
+                    "
+                    INSERT INTO {} (id, payload_msgpack)
+                    VALUES (?1, ?2)
+                    ON CONFLICT(id) DO NOTHING
+                    ",
+                    SQLITE_STORE_TABLE_NAME
+                ),
+                params![&key_text, &initial_payload_msgpack],
+            );
+            match insert_result {
+                Ok(rows_affected) => {
+                    if rows_affected > 0 {
+                        return Ok(initial_value);
+                    }
+
+                    let existing_payload_msgpack = self
+                        .connection
+                        .query_row(
+                            &format!(
+                                "SELECT payload_msgpack FROM {} WHERE id = ?1",
+                                SQLITE_STORE_TABLE_NAME
+                            ),
+                            params![&key_text],
+                            |row| row.get::<_, Vec<u8>>(0),
+                        )
+                        .optional()
+                        .map_err(|e| {
+                            format!(
+                                "Failed to query key {} from table {} at {}: {}",
+                                key_text,
+                                SQLITE_STORE_TABLE_NAME,
+                                self.db_path.display(),
+                                e
+                            )
+                        })?
+                        .ok_or_else(|| {
+                            format!(
+                                "Insert conflict for key {} in table {} at {} returned no row",
+                                key_text,
+                                SQLITE_STORE_TABLE_NAME,
+                                self.db_path.display()
+                            )
+                        })?;
+
+                    return rmp_serde::from_slice::<V>(&existing_payload_msgpack).map_err(|e| {
+                        format!(
+                            "Failed to deserialize sqlite payload for table {} in {}: {}",
+                            SQLITE_STORE_TABLE_NAME,
+                            self.db_path.display(),
+                            e
+                        )
+                    });
+                }
+                Err(error) if Self::is_sqlite_busy_or_locked(&error) && attempt < max_retries => {
+                    sleep(Self::busy_retry_delay(attempt, base_delay_ms));
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "Failed to initialize sqlite payload for key {} in table {} at {} after {} retries: {}",
+                        key_text,
+                        SQLITE_STORE_TABLE_NAME,
+                        self.db_path.display(),
+                        attempt,
+                        error
+                    ));
+                }
+            }
+        }
+        Err(format!(
+            "Failed to initialize sqlite payload for key {} in table {} at {} due to persistent sqlite lock",
+            key_text,
+            SQLITE_STORE_TABLE_NAME,
+            self.db_path.display()
+        ))
+    }
+
     pub fn get_keys(&self) -> Result<Vec<K>, String> {
         let mut statement = self
             .connection
