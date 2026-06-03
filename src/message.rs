@@ -8,11 +8,17 @@ pub enum Severity {
     Warning,
     Error,
 }
-#[derive(Serialize, Deserialize, Debug)]
-pub enum MyLogMessage {
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum TuiMessage {
     Line {
         message: String,
         severity: Severity,
+    },
+    State {
+        state: String,
+    },
+    WindowName {
+        window_name: String,
     },
     KeyValuePair {
         key: String,
@@ -32,24 +38,26 @@ pub enum MyLogMessage {
     },
 }
 
-impl MyLogMessage {
+impl TuiMessage {
     pub fn to_string(&self) -> String {
         match self {
-            MyLogMessage::Line { message, severity } => match severity {
+            TuiMessage::Line { message, severity } => match severity {
                 Severity::Info => format!("INFO: {message}"),
                 Severity::Warning => format!("WARNING: {message}"),
                 Severity::Error => format!("ERROR: {message}"),
             },
-            MyLogMessage::KeyValuePair { key, value } => format!("{key}: {value}"),
-            MyLogMessage::WorkerProgress {
+            TuiMessage::State { state } => format!("STATE: {state}"),
+            TuiMessage::WindowName { window_name } => format!("WINDOW NAME: {window_name}"),
+            TuiMessage::KeyValuePair { key, value } => format!("{key}: {value}"),
+            TuiMessage::WorkerProgress {
                 worker_name,
                 progress,
                 label,
             } => format!("Worker {worker_name} Progress - {label}: {progress:.2}%"),
-            MyLogMessage::MasterProgress { progress, label } => {
+            TuiMessage::MasterProgress { progress, label } => {
                 format!("Master Progress - {label}: {progress:.2}%")
             }
-            MyLogMessage::DeleteWorkerBar { worker_name } => {
+            TuiMessage::DeleteWorkerBar { worker_name } => {
                 format!("Delete progress bar for worker {worker_name}")
             }
         }

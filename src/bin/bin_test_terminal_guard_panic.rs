@@ -1,12 +1,13 @@
 use std::io;
 use std::time::Duration;
 
-use research_utility::log_message::{log_key_value_pair, log_worker_progress};
-use research_utility::progress_screen::ProgressScreen;
+use research_utility::progress_tui_server::{
+    ProgressTuiServer, log_key_value_pair, log_worker_progress,
+};
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    ProgressScreen::initialize("Terminal Guard Panic Test".to_string(), false, None).await?;
+    ProgressTuiServer::initialize(None, |_command| {}).await?;
 
     log_key_value_pair(
         "status".to_string(),
@@ -23,7 +24,7 @@ async fn main() -> io::Result<()> {
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    match ProgressScreen::shutdown().await {
+    match ProgressTuiServer::shutdown().await {
         Ok(()) => {
             println!("unexpected: shutdown succeeded");
             Ok(())

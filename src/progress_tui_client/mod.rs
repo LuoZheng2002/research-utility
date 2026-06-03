@@ -1,13 +1,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::fs::OpenOptions;
 use std::io;
-use std::io::Write;
-use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 
-use arc_swap::ArcSwapOption;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -19,186 +18,99 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Gauge, Paragraph, Wrap},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::net::TcpStream;
 
-use crate::message::{MyLogMessage, Severity};
+use crate::message::{Severity, TuiMessage};
+use crate::progress_tui_protocol::{
+    ProgressClientMessage, ProgressGaugeState, ProgressServerMessage, ProgressSnapshot,
+    read_framed_message, send_framed_message,
+};
 
-pub const PROGRESS_SCREEN_KEY_ORDER: &[&str] = &["status"];
+const WINDOW_TITLE: &str = "Progress Screen";
 const MAX_LOG_LINES: usize = 100;
-const DEFAULT_REDRAW_INTERVAL: Duration = Duration::from_millis(100);
-const DEFAULT_PERSIST_EXIT_HINT: &str = "All tasks are done.";
-const PRESS_Q_TO_EXIT_HINT: &str = " Press Q to exit.";
+const REDRAW_INTERVAL: Duration = Duration::from_millis(100);
+const SERVER_DISCONNECTED_HINT: &str = "Server disconnected. Ctrl+C to exit.";
+const KEY_ORDER: &[&str] = &["status"];
 
-pub(crate) static PROGRESS_SCREEN_MESSAGE_TX: ArcSwapOption<mpsc::UnboundedSender<MyLogMessage>> =
-    ArcSwapOption::const_empty();
+pub async fn run(addr: String) -> io::Result<()> {
+    let _terminal_guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
 
-struct RunConfig {
-    window_title: String,
-    key_order: Vec<String>,
-    redraw_interval: Duration,
-    persist_after_channel_close: bool,
-}
+    let stream = TcpStream::connect(&addr).await?;
+    let (mut reader, mut writer) = stream.into_split();
+    let (client_message_tx, mut client_message_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ProgressClientMessage>();
+    client_message_tx
+        .send(ProgressClientMessage::SnapshotRequest)
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "failed to queue snapshot request",
+            )
+        })?;
 
-pub struct ProgressScreen;
-
-struct ProgressScreenRuntime {
-    join_handle: Option<tokio::task::JoinHandle<io::Result<()>>>,
-    shutdown_tx: Option<oneshot::Sender<()>>,
-}
-
-static PROGRESS_SCREEN_RUNTIME: OnceLock<parking_lot::Mutex<ProgressScreenRuntime>> =
-    OnceLock::new();
-
-static PERSISTENT_EXIT_HINT: LazyLock<parking_lot::Mutex<String>> =
-    LazyLock::new(|| parking_lot::Mutex::new(DEFAULT_PERSIST_EXIT_HINT.to_string()));
-
-fn runtime_state() -> &'static parking_lot::Mutex<ProgressScreenRuntime> {
-    PROGRESS_SCREEN_RUNTIME.get_or_init(|| {
-        parking_lot::Mutex::new(ProgressScreenRuntime {
-            join_handle: None,
-            shutdown_tx: None,
-        })
-    })
-}
-
-impl ProgressScreen {
-    pub async fn initialize(
-        window_title: impl Into<String>,
-        persist_after_channel_close: bool,
-        log_file: Option<String>,
-    ) -> io::Result<()> {
-        let mut runtime = runtime_state()
-            .lock();
-        if runtime.join_handle.is_some() {
-            return Ok(());
+    let writer_task = tokio::spawn(async move {
+        while let Some(message) = client_message_rx.recv().await {
+            send_framed_message(&mut writer, &message).await?;
         }
+        Ok::<(), io::Error>(())
+    });
 
-        let config = RunConfig {
-            window_title: window_title.into(),
-            key_order: PROGRESS_SCREEN_KEY_ORDER
-                .iter()
-                .map(|key| (*key).to_string())
-                .collect(),
-            redraw_interval: DEFAULT_REDRAW_INTERVAL,
-            persist_after_channel_close,
-        };
+    let mut state = ProgressScreenState::new();
+    let mut redraw_interval = tokio::time::interval(REDRAW_INTERVAL);
+    let mut server_disconnected = false;
 
-        let (my_log_message_tx, my_log_message_rx) = mpsc::unbounded_channel();
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        // set_my_log_message_tx(my_log_message_tx);
-        PROGRESS_SCREEN_MESSAGE_TX.store(Some(Arc::new(my_log_message_tx)));
-
-        let join_handle = tokio::spawn(async move {
-            Self::run(config, my_log_message_rx, shutdown_rx, log_file).await
-        });
-        runtime.shutdown_tx = Some(shutdown_tx);
-        runtime.join_handle = Some(join_handle);
-        Ok(())
-    }
-
-    pub async fn shutdown() -> io::Result<()> {
-        let (shutdown_tx, join_handle) = {
-            let mut runtime = runtime_state()
-                .lock();
-            (runtime.shutdown_tx.take(), runtime.join_handle.take())
-        };
-
-        // clear_my_log_message_tx();
-        PROGRESS_SCREEN_MESSAGE_TX.store(None);
-
-        if let Some(shutdown_tx) = shutdown_tx {
-            let _ = shutdown_tx.send(());
-        }
-
-        match join_handle {
-            Some(join_handle) => match join_handle.await {
-                Ok(result) => result,
-                Err(err) => Err(io::Error::other(format!(
-                    "progress screen task join error: {err}"
-                ))),
-            },
-            None => Ok(()),
-        }
-    }
-    pub fn set_persist_exit_hint(hint: impl Into<String>) {
-        let mut guard = PERSISTENT_EXIT_HINT
-            .lock();
-        *guard = hint.into();
-    }
-
-    async fn run(
-        config: RunConfig,
-        mut my_log_message_rx: mpsc::UnboundedReceiver<MyLogMessage>,
-        mut shutdown_rx: oneshot::Receiver<()>,
-        log_file: Option<String>,
-    ) -> io::Result<()> {
-        let _terminal_guard = TerminalGuard::enter()?;
-        let backend = CrosstermBackend::new(io::stdout());
-        let mut terminal = Terminal::new(backend)?;
-        terminal.clear()?;
-
-        let mut state = ProgressScreenState::new();
-        let mut redraw_interval = tokio::time::interval(config.redraw_interval);
-        let mut my_log_channel_closed = false;
-        let mut shutdown_requested = false;
-        let mut log_file_writer = log_file
-            .map(|path| {
-                OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(path)
-            })
-            .transpose()?;
-
-        loop {
-            tokio::select! {
-                recv_result = my_log_message_rx.recv() => {
-                    match recv_result {
-                        Some(message) => {
-                            write_line_to_log_file_if_enabled(&message, &mut log_file_writer)?;
-                            state.handle_message(message)
-                        }
-                        None => {
-                            my_log_channel_closed = true;
-                            if !config.persist_after_channel_close {
-                                break;
-                            }
-                        }
+    loop {
+        tokio::select! {
+            wire_message = read_framed_message::<_, ProgressServerMessage>(&mut reader), if !server_disconnected => {
+                match wire_message? {
+                    Some(ProgressServerMessage::Snapshot(snapshot)) => {
+                        state.apply_snapshot(snapshot);
                     }
-                    if handle_input_events(&mut state)? {
-                        return Ok(());
+                    Some(ProgressServerMessage::Update(message)) => {
+                        state.handle_message(message);
+                    }
+                    None => {
+                        server_disconnected = true;
                     }
                 }
-                _ = &mut shutdown_rx, if !shutdown_requested => {
-                    shutdown_requested = true;
-                    my_log_channel_closed = true;
-                    if !config.persist_after_channel_close {
-                        break;
-                    }
-                    if handle_input_events(&mut state)? {
-                        return Ok(());
-                    }
+                let actions = handle_input_events(&mut state)?;
+                if actions.quit {
+                    break;
                 }
-                _ = redraw_interval.tick() => {
-                    if handle_input_events(&mut state)? {
-                        return Ok(());
-                    }
-                    draw(&mut terminal, &mut state, &config, my_log_channel_closed)?;
+                for command in actions.commands {
+                    let _ = client_message_tx.send(ProgressClientMessage::SubmitCommand { command });
                 }
             }
+            _ = redraw_interval.tick() => {
+                let actions = handle_input_events(&mut state)?;
+                if actions.quit {
+                    break;
+                }
+                for command in actions.commands {
+                    let _ = client_message_tx.send(ProgressClientMessage::SubmitCommand { command });
+                }
+                draw(&mut terminal, &mut state, server_disconnected)?;
+            }
         }
-
-        Ok(())
     }
-}
 
-struct MasterOrWorkerProgress {
-    progress: f32,
-    label: String,
+    drop(client_message_tx);
+    match writer_task.await {
+        Ok(result) => result?,
+        Err(err) => {
+            return Err(io::Error::other(format!("writer task join error: {err}")));
+        }
+    }
+
+    Ok(())
 }
 
 struct ProgressScreenState {
+    state_text: String,
+    window_name: String,
     key_values: HashMap<String, String>,
     stats_scroll_from_bottom: usize,
     stats_viewport_height: usize,
@@ -207,8 +119,9 @@ struct ProgressScreenState {
     log_viewport_height: usize,
     stats_area: Rect,
     log_area: Rect,
-    worker_progress: BTreeMap<String, MasterOrWorkerProgress>,
-    master_progress: MasterOrWorkerProgress,
+    worker_progress: BTreeMap<String, ProgressGaugeState>,
+    master_progress: ProgressGaugeState,
+    command_input: String,
 }
 
 struct LogLine {
@@ -219,6 +132,8 @@ struct LogLine {
 impl ProgressScreenState {
     fn new() -> Self {
         Self {
+            state_text: String::new(),
+            window_name: WINDOW_TITLE.to_string(),
             key_values: HashMap::new(),
             stats_scroll_from_bottom: 0,
             stats_viewport_height: 1,
@@ -228,22 +143,37 @@ impl ProgressScreenState {
             stats_area: Rect::default(),
             log_area: Rect::default(),
             worker_progress: BTreeMap::new(),
-            master_progress: MasterOrWorkerProgress {
+            master_progress: ProgressGaugeState {
                 progress: 0.0,
                 label: "0%".to_string(),
             },
+            command_input: String::new(),
         }
     }
 
-    fn handle_message(&mut self, message: MyLogMessage) {
+    fn apply_snapshot(&mut self, snapshot: ProgressSnapshot) {
+        self.state_text = snapshot.state;
+        self.window_name = snapshot.window_name;
+        self.key_values = snapshot.key_values;
+        self.worker_progress = snapshot.worker_progress;
+        self.master_progress = snapshot.master_progress;
+    }
+
+    fn handle_message(&mut self, message: TuiMessage) {
         match message {
-            MyLogMessage::Line { message, severity } => {
+            TuiMessage::Line { message, severity } => {
                 self.push_log_line(message, severity);
             }
-            MyLogMessage::KeyValuePair { key, value } => {
+            TuiMessage::State { state } => {
+                self.state_text = state;
+            }
+            TuiMessage::WindowName { window_name } => {
+                self.window_name = window_name;
+            }
+            TuiMessage::KeyValuePair { key, value } => {
                 self.key_values.insert(key, value);
             }
-            MyLogMessage::WorkerProgress {
+            TuiMessage::WorkerProgress {
                 worker_name,
                 progress,
                 label,
@@ -254,17 +184,17 @@ impl ProgressScreenState {
                     progress
                 );
                 self.worker_progress
-                    .insert(worker_name, MasterOrWorkerProgress { progress, label });
+                    .insert(worker_name, ProgressGaugeState { progress, label });
             }
-            MyLogMessage::MasterProgress { progress, label } => {
+            TuiMessage::MasterProgress { progress, label } => {
                 assert!(
                     (0.0..=1.0).contains(&progress),
                     "MasterProgress.progress must be in [0, 1], got {}",
                     progress
                 );
-                self.master_progress = MasterOrWorkerProgress { progress, label };
+                self.master_progress = ProgressGaugeState { progress, label };
             }
-            MyLogMessage::DeleteWorkerBar { worker_name } => {
+            TuiMessage::DeleteWorkerBar { worker_name } => {
                 self.worker_progress.remove(&worker_name);
             }
         }
@@ -334,6 +264,12 @@ impl ProgressScreenState {
 
 struct TerminalGuard;
 
+#[derive(Default)]
+struct InputActions {
+    quit: bool,
+    commands: Vec<String>,
+}
+
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
@@ -349,12 +285,51 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn handle_input_events(state: &mut ProgressScreenState) -> io::Result<bool> {
+fn handle_input_events(state: &mut ProgressScreenState) -> io::Result<InputActions> {
+    let mut actions = InputActions::default();
     while event::poll(Duration::from_millis(0))? {
         match event::read()? {
             Event::Key(key_event) => {
-                if key_event.code == KeyCode::Char('Q') || key_event.code == KeyCode::Char('q') {
-                    return Ok(true);
+                if key_event.kind != KeyEventKind::Press {
+                    continue;
+                }
+
+                let is_ctrl_quit = key_event.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(
+                        key_event.code,
+                        KeyCode::Char('c')
+                            | KeyCode::Char('C')
+                            | KeyCode::Char('q')
+                            | KeyCode::Char('Q')
+                    );
+                if is_ctrl_quit {
+                    actions.quit = true;
+                    break;
+                }
+
+                match key_event.code {
+                    KeyCode::Enter => {
+                        let command = state.command_input.trim().to_string();
+                        if !command.is_empty() {
+                            actions.commands.push(command);
+                        }
+                        state.command_input.clear();
+                    }
+                    KeyCode::Backspace => {
+                        state.command_input.pop();
+                    }
+                    KeyCode::Esc => {
+                        state.command_input.clear();
+                    }
+                    KeyCode::Char(ch) => {
+                        if !key_event
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        {
+                            state.command_input.push(ch);
+                        }
+                    }
+                    _ => {}
                 }
             }
             Event::Mouse(mouse_event) => match mouse_event.kind {
@@ -369,25 +344,24 @@ fn handle_input_events(state: &mut ProgressScreenState) -> io::Result<bool> {
             _ => {}
         }
     }
-    Ok(false)
+    Ok(actions)
 }
 
 fn draw(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &mut ProgressScreenState,
-    config: &RunConfig,
-    my_log_channel_closed: bool,
+    server_disconnected: bool,
 ) -> io::Result<()> {
     terminal.draw(|frame| {
         let area = frame.area();
-        let show_persist_exit_hint = config.persist_after_channel_close && my_log_channel_closed;
         let main_layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(6),
                 Constraint::Length((state.worker_progress.len() as u16) + 2),
                 Constraint::Length(3),
-                Constraint::Length(if show_persist_exit_hint { 3 } else { 0 }),
+                Constraint::Length(if server_disconnected { 3 } else { 0 }),
+                Constraint::Length(3),
             ])
             .split(area);
 
@@ -395,11 +369,27 @@ fn draw(
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(main_layout[0]);
-        state.set_top_window_areas(stats_layout[0], stats_layout[1]);
 
-        let ordered_lines = ordered_key_value_lines(&state.key_values, &config.key_order);
-        state.stats_viewport_height = log_inner_height(stats_layout[0]);
-        let stats_inner_width = log_inner_width(stats_layout[0]);
+        let state_has_text = !state.state_text.trim().is_empty();
+        let stats_left_layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(if state_has_text { 3 } else { 0 }),
+                Constraint::Min(3),
+            ])
+            .split(stats_layout[0]);
+        state.set_top_window_areas(stats_left_layout[1], stats_layout[1]);
+
+        if state_has_text {
+            let state_window = Paragraph::new(state.state_text.as_str())
+                .block(Block::default().borders(Borders::ALL).title("State"))
+                .wrap(Wrap { trim: true });
+            frame.render_widget(state_window, stats_left_layout[0]);
+        }
+
+        let ordered_lines = ordered_key_value_lines(&state.key_values);
+        state.stats_viewport_height = log_inner_height(stats_left_layout[1]);
+        let stats_inner_width = log_inner_width(stats_left_layout[1]);
         let stats_total_rows = wrapped_lines_height(&ordered_lines, stats_inner_width);
         state.clamp_stats_scroll(stats_total_rows);
         let stats_max_scroll = stats_total_rows.saturating_sub(state.stats_viewport_height.max(1));
@@ -408,11 +398,11 @@ fn draw(
         let key_value_window = Paragraph::new(ordered_lines)
             .block(Block::default().borders(Borders::ALL).title(format!(
                 "{} - Stats (offset {}/{})",
-                config.window_title, state.stats_scroll_from_bottom, stats_max_scroll
+                state.window_name, state.stats_scroll_from_bottom, stats_max_scroll
             )))
             .scroll((stats_scroll_from_top, 0))
             .wrap(Wrap { trim: false });
-        frame.render_widget(key_value_window, stats_layout[0]);
+        frame.render_widget(key_value_window, stats_left_layout[1]);
 
         state.log_viewport_height = log_inner_height(stats_layout[1]);
         let log_inner_width = log_inner_width(stats_layout[1]);
@@ -462,29 +452,33 @@ fn draw(
             .style(Style::default().fg(Color::Green));
         frame.render_widget(master_gauge, main_layout[2]);
 
-        if show_persist_exit_hint {
-            let hint =
-                Paragraph::new(PERSISTENT_EXIT_HINT.lock().clone() + PRESS_Q_TO_EXIT_HINT)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title("Program Ended"),
-                    );
+        if server_disconnected {
+            let hint = Paragraph::new(SERVER_DISCONNECTED_HINT)
+                .block(Block::default().borders(Borders::ALL).title("Disconnected"));
             frame.render_widget(hint, main_layout[3]);
         }
+
+        let command_area = if server_disconnected {
+            main_layout[4]
+        } else {
+            main_layout[3]
+        };
+        let command_input = Paragraph::new(state.command_input.as_str()).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Command (Enter to send, Esc to clear, Ctrl+C to exit)"),
+        );
+        frame.render_widget(command_input, command_area);
     })?;
     Ok(())
 }
 
-fn ordered_key_value_lines(
-    key_values: &HashMap<String, String>,
-    key_order: &[String],
-) -> Vec<Line<'static>> {
-    let known_key_set: HashSet<&str> = key_order.iter().map(String::as_str).collect();
+fn ordered_key_value_lines(key_values: &HashMap<String, String>) -> Vec<Line<'static>> {
+    let known_key_set: HashSet<&str> = KEY_ORDER.iter().copied().collect();
 
-    let mut ordered_keys: Vec<&str> = key_order
+    let mut ordered_keys: Vec<&str> = KEY_ORDER
         .iter()
-        .map(String::as_str)
+        .copied()
         .filter(|key| key_values.contains_key(*key))
         .collect();
 
@@ -548,20 +542,4 @@ fn wrapped_lines_height(lines: &[Line<'_>], inner_width: usize) -> usize {
         .iter()
         .map(|line| line.width().max(1).div_ceil(inner_width))
         .sum()
-}
-
-fn write_line_to_log_file_if_enabled(
-    message: &MyLogMessage,
-    log_file_writer: &mut Option<std::fs::File>,
-) -> io::Result<()> {
-    let Some(file) = log_file_writer.as_mut() else {
-        return Ok(());
-    };
-
-    if let MyLogMessage::Line { message, .. } = message {
-        file.write_all(message.as_bytes())?;
-        file.write_all(b"\n")?;
-    }
-
-    Ok(())
 }

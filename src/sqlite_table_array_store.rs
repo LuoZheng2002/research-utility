@@ -257,7 +257,7 @@ where
     ) -> Result<Option<Vec<u8>>, String> {
         self.connection
             .lock()
-                .query_row(
+            .query_row(
                 &format!(
                     "
                     SELECT payload_msgpack
