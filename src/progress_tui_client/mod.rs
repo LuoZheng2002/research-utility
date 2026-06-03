@@ -23,7 +23,7 @@ use tokio::net::TcpStream;
 use crate::message::{Severity, TuiMessage};
 use crate::progress_tui_protocol::{
     ProgressClientMessage, ProgressGaugeState, ProgressServerMessage, ProgressStats,
-    read_framed_message, send_framed_message,
+    framed_reader, framed_writer, read_framed_message, send_framed_message,
 };
 
 const WINDOW_TITLE: &str = "Progress Screen";
@@ -39,7 +39,9 @@ pub async fn run(addr: String) -> io::Result<()> {
     terminal.clear()?;
 
     let stream = TcpStream::connect(&addr).await?;
-    let (mut reader, mut writer) = stream.into_split();
+    let (reader, writer) = stream.into_split();
+    let mut reader = framed_reader(reader);
+    let mut writer = framed_writer(writer);
     let (client_message_tx, mut client_message_rx) =
         tokio::sync::mpsc::unbounded_channel::<ProgressClientMessage>();
     client_message_tx

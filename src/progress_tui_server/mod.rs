@@ -10,7 +10,7 @@ use tokio::sync::{broadcast, oneshot};
 use crate::message::{Severity, TuiMessage};
 use crate::progress_tui_protocol::{
     ProgressClientMessage, ProgressServerMessage, ProgressStats, progress_screen_server_addr,
-    read_framed_message, send_framed_message,
+    framed_reader, framed_writer, read_framed_message, send_framed_message,
 };
 
 const SERVER_BROADCAST_CHANNEL_CAPACITY: usize = 1024;
@@ -212,7 +212,9 @@ async fn handle_client(
     state: Arc<ProgressTuiServerState>,
     client_command_handler: ClientCommandHandler,
 ) -> io::Result<()> {
-    let (mut reader, mut writer) = socket.into_split();
+    let (reader, writer) = socket.into_split();
+    let mut reader = framed_reader(reader);
+    let mut writer = framed_writer(writer);
     let mut update_rx = state.tcp_broadcast_tx.subscribe();
 
     loop {
