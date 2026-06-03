@@ -402,7 +402,7 @@ fn draw(
         let ordered_lines = ordered_key_value_lines(&state.key_values);
         state.stats_viewport_height = log_inner_height(stats_left_layout[1]);
         let stats_inner_width = log_inner_width(stats_left_layout[1]);
-        let stats_total_rows = wrapped_lines_height(&ordered_lines, stats_inner_width);
+        let stats_total_rows = wrapped_lines_height(&ordered_lines, stats_inner_width, false);
         state.clamp_stats_scroll(stats_total_rows);
         let stats_max_scroll = stats_total_rows.saturating_sub(state.stats_viewport_height.max(1));
         let stats_scroll_from_top =
@@ -419,7 +419,7 @@ fn draw(
         state.log_viewport_height = log_inner_height(stats_layout[1]);
         let log_inner_width = log_inner_width(stats_layout[1]);
         let log_lines = rendered_log_lines(&state.log_lines);
-        let log_total_rows = wrapped_lines_height(&log_lines, log_inner_width);
+        let log_total_rows = wrapped_lines_height(&log_lines, log_inner_width, false);
         state.clamp_log_scroll(log_total_rows);
         let max_scroll = log_total_rows.saturating_sub(state.log_viewport_height.max(1));
         let log_block = Block::default().borders(Borders::ALL).title(format!(
@@ -545,13 +545,12 @@ fn log_inner_width(log_area: ratatui::layout::Rect) -> usize {
     log_area.width.saturating_sub(2) as usize
 }
 
-fn wrapped_lines_height(lines: &[Line<'_>], inner_width: usize) -> usize {
+fn wrapped_lines_height(lines: &[Line<'_>], inner_width: usize, trim: bool) -> usize {
     if inner_width == 0 {
         return 0;
     }
 
-    lines
-        .iter()
-        .map(|line| line.width().max(1).div_ceil(inner_width))
-        .sum()
+    Paragraph::new(lines.to_vec())
+        .wrap(Wrap { trim })
+        .line_count(inner_width as u16)
 }
