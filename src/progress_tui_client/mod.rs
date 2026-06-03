@@ -22,7 +22,7 @@ use tokio::net::TcpStream;
 
 use crate::message::{Severity, TuiMessage};
 use crate::progress_tui_protocol::{
-    ProgressClientMessage, ProgressGaugeState, ProgressServerMessage, ProgressSnapshot,
+    ProgressClientMessage, ProgressGaugeState, ProgressServerMessage, ProgressStats,
     read_framed_message, send_framed_message,
 };
 
@@ -151,7 +151,7 @@ impl ProgressScreenState {
         }
     }
 
-    fn apply_snapshot(&mut self, snapshot: ProgressSnapshot) {
+    fn apply_snapshot(&mut self, snapshot: ProgressStats) {
         self.state_text = snapshot.state;
         self.window_name = snapshot.window_name;
         self.key_values = snapshot.key_values;

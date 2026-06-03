@@ -19,7 +19,7 @@ pub struct ProgressGaugeState {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ProgressSnapshot {
+pub struct ProgressStats {
     pub state: String,
     pub window_name: String,
     pub key_values: HashMap<String, String>,
@@ -27,7 +27,7 @@ pub struct ProgressSnapshot {
     pub master_progress: ProgressGaugeState,
 }
 
-impl Default for ProgressSnapshot {
+impl Default for ProgressStats {
     fn default() -> Self {
         Self {
             state: String::new(),
@@ -42,7 +42,7 @@ impl Default for ProgressSnapshot {
     }
 }
 
-impl ProgressSnapshot {
+impl ProgressStats {
     pub fn apply_message(&mut self, message: &TuiMessage) {
         match message {
             TuiMessage::Line { .. } => {}
@@ -99,7 +99,7 @@ pub enum ProgressClientMessage {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ProgressServerMessage {
-    Snapshot(ProgressSnapshot),
+    Snapshot(ProgressStats),
     Update(TuiMessage),
 }
 

@@ -1,7 +1,7 @@
 use std::fs::OpenOptions;
 use std::io;
 use std::io::Write;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
 use tokio::net::{TcpListener, TcpStream};
@@ -9,7 +9,7 @@ use tokio::sync::{broadcast, oneshot};
 
 use crate::message::{Severity, TuiMessage};
 use crate::progress_tui_protocol::{
-    ProgressClientMessage, ProgressServerMessage, ProgressSnapshot, progress_screen_server_addr,
+    ProgressClientMessage, ProgressServerMessage, ProgressStats, progress_screen_server_addr,
     read_framed_message, send_framed_message,
 };
 
@@ -21,30 +21,16 @@ struct RunConfig {
     client_command_handler: ClientCommandHandler,
 }
 
-struct ProgressTuiServerRuntime {
-    join_handle: Option<tokio::task::JoinHandle<io::Result<()>>>,
-    shutdown_tx: Option<oneshot::Sender<()>>,
-}
-
-struct ProgressTuiServerShared {
-    state: parking_lot::Mutex<ProgressSnapshot>,
-    update_tx: broadcast::Sender<TuiMessage>,
+struct ProgressTuiServerState {
+    stats: parking_lot::Mutex<ProgressStats>,
+    tcp_broadcast_tx: broadcast::Sender<TuiMessage>,
     log_file_writer: parking_lot::Mutex<Option<std::fs::File>>,
+    join_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<io::Result<()>>>>,
+    shutdown_tx: parking_lot::Mutex<Option<oneshot::Sender<()>>>,
 }
 
-static PROGRESS_TUI_SERVER_RUNTIME: OnceLock<parking_lot::Mutex<ProgressTuiServerRuntime>> =
-    OnceLock::new();
-static PROGRESS_TUI_SERVER_SHARED: ArcSwapOption<ProgressTuiServerShared> =
+static PROGRESS_TUI_SERVER_STATE: ArcSwapOption<ProgressTuiServerState> =
     ArcSwapOption::const_empty();
-
-fn runtime_state() -> &'static parking_lot::Mutex<ProgressTuiServerRuntime> {
-    PROGRESS_TUI_SERVER_RUNTIME.get_or_init(|| {
-        parking_lot::Mutex::new(ProgressTuiServerRuntime {
-            join_handle: None,
-            shutdown_tx: None,
-        })
-    })
-}
 
 pub struct ProgressTuiServer;
 
@@ -56,8 +42,7 @@ impl ProgressTuiServer {
     where
         F: Fn(String) + Send + Sync + 'static,
     {
-        let mut runtime = runtime_state().lock();
-        if runtime.join_handle.is_some() {
+        if PROGRESS_TUI_SERVER_STATE.load_full().is_some() {
             return Ok(());
         }
 
@@ -71,34 +56,40 @@ impl ProgressTuiServer {
             })
             .transpose()?;
 
-        let (update_tx, _unused_rx) =
+        let (tcp_broadcast_tx, _unused_rx) =
             broadcast::channel::<TuiMessage>(SERVER_BROADCAST_CHANNEL_CAPACITY);
-        let shared = Arc::new(ProgressTuiServerShared {
-            state: parking_lot::Mutex::new(ProgressSnapshot::default()),
-            update_tx,
+        let state = Arc::new(ProgressTuiServerState {
+            stats: parking_lot::Mutex::new(ProgressStats::default()),
+            tcp_broadcast_tx,
             log_file_writer: parking_lot::Mutex::new(log_file_writer),
+            join_handle: parking_lot::Mutex::new(None),
+            shutdown_tx: parking_lot::Mutex::new(None),
         });
-        PROGRESS_TUI_SERVER_SHARED.store(Some(Arc::clone(&shared)));
 
         let config = RunConfig {
             client_command_handler: Arc::new(client_command_handler),
         };
         let listener = TcpListener::bind(progress_screen_server_addr()).await?;
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let state_for_task = Arc::clone(&state);
 
-        let join_handle =
-            tokio::spawn(async move { run(config, listener, shared, shutdown_rx).await });
-        runtime.shutdown_tx = Some(shutdown_tx);
-        runtime.join_handle = Some(join_handle);
+        let join_handle = tokio::spawn(async move {
+            run(config, listener, Arc::clone(&state_for_task), shutdown_rx).await
+        });
+        *state.shutdown_tx.lock() = Some(shutdown_tx);
+        *state.join_handle.lock() = Some(join_handle);
+        PROGRESS_TUI_SERVER_STATE.store(Some(state));
         Ok(())
     }
 
     pub async fn shutdown() -> io::Result<()> {
-        let (shutdown_tx, join_handle) = {
-            let mut runtime = runtime_state().lock();
-            (runtime.shutdown_tx.take(), runtime.join_handle.take())
+        let Some(state) = PROGRESS_TUI_SERVER_STATE.load_full() else {
+            return Ok(());
         };
-        PROGRESS_TUI_SERVER_SHARED.store(None);
+        PROGRESS_TUI_SERVER_STATE.store(None);
+
+        let shutdown_tx = state.shutdown_tx.lock().take();
+        let join_handle = state.join_handle.lock().take();
 
         if let Some(shutdown_tx) = shutdown_tx {
             let _ = shutdown_tx.send(());
@@ -117,15 +108,13 @@ impl ProgressTuiServer {
 }
 
 pub fn log_message(message: TuiMessage) {
-    let maybe_shared = PROGRESS_TUI_SERVER_SHARED.load_full();
-    let Some(shared) = maybe_shared else {
+    let Some(state) = PROGRESS_TUI_SERVER_STATE.load_full() else {
         println!("{}", message.to_string());
         return;
     };
-
-    write_line_to_log_file_if_enabled(&message, &shared.log_file_writer);
-    shared.state.lock().apply_message(&message);
-    let _ = shared.update_tx.send(message);
+    write_line_to_log_file_if_enabled(&message, &state.log_file_writer);
+    state.stats.lock().apply_message(&message);
+    let _ = state.tcp_broadcast_tx.send(message);
 }
 
 pub fn log_info(message: impl Into<String>) {
@@ -196,17 +185,17 @@ pub fn delete_worker_progress_bar(worker_name: impl Into<String>) {
 async fn run(
     config: RunConfig,
     listener: TcpListener,
-    shared: Arc<ProgressTuiServerShared>,
+    state: Arc<ProgressTuiServerState>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) -> io::Result<()> {
     loop {
         tokio::select! {
             accept_result = listener.accept() => {
                 let (socket, _) = accept_result?;
-                let shared = Arc::clone(&shared);
+                let state = Arc::clone(&state);
                 let client_command_handler = Arc::clone(&config.client_command_handler);
                 tokio::spawn(async move {
-                    let _ = handle_client(socket, shared, client_command_handler).await;
+                    let _ = handle_client(socket, state, client_command_handler).await;
                 });
             }
             _ = &mut shutdown_rx => {
@@ -220,18 +209,18 @@ async fn run(
 
 async fn handle_client(
     socket: TcpStream,
-    shared: Arc<ProgressTuiServerShared>,
+    state: Arc<ProgressTuiServerState>,
     client_command_handler: ClientCommandHandler,
 ) -> io::Result<()> {
     let (mut reader, mut writer) = socket.into_split();
-    let mut update_rx = shared.update_tx.subscribe();
+    let mut update_rx = state.tcp_broadcast_tx.subscribe();
 
     loop {
         tokio::select! {
             wire_message = read_framed_message::<_, ProgressClientMessage>(&mut reader) => {
                 match wire_message? {
                     Some(ProgressClientMessage::SnapshotRequest) => {
-                        let snapshot = shared.state.lock().clone();
+                        let snapshot = state.stats.lock().clone();
                         send_framed_message(&mut writer, &ProgressServerMessage::Snapshot(snapshot)).await?;
                     }
                     Some(ProgressClientMessage::SubmitCommand { command }) => {
