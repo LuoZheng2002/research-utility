@@ -28,11 +28,15 @@ use crate::progress_tui_protocol::{
 
 const WINDOW_TITLE: &str = "Progress Screen";
 const MAX_LOG_LINES: usize = 100;
-const REDRAW_INTERVAL: Duration = Duration::from_millis(100);
+const DEFAULT_REDRAW_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_SERVER_DISCONNECTED_HINT: &str = "Server disconnected. Ctrl+C to exit.";
 const KEY_ORDER: &[&str] = &["status"];
 
 pub async fn run(addr: String) -> io::Result<()> {
+    run_with_redraw_interval(addr, DEFAULT_REDRAW_INTERVAL).await
+}
+
+pub async fn run_with_redraw_interval(addr: String, redraw_interval_duration: Duration) -> io::Result<()> {
     let _terminal_guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -61,7 +65,7 @@ pub async fn run(addr: String) -> io::Result<()> {
     });
 
     let mut state = ProgressScreenState::new();
-    let mut redraw_interval = tokio::time::interval(REDRAW_INTERVAL);
+    let mut redraw_interval = tokio::time::interval(redraw_interval_duration);
     let mut server_disconnected = false;
 
     loop {

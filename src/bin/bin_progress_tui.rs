@@ -6,6 +6,8 @@ use research_utility::progress_tui_client;
 use research_utility::progress_tui_protocol::progress_screen_server_addr;
 use tokio::net::TcpStream;
 
+const REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+
 #[derive(Debug, Parser)]
 #[command(name = "bin_progress_tui")]
 #[command(about = "Progress screen TCP client")]
@@ -19,11 +21,11 @@ struct Cli {
     addr: String,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> io::Result<()> {
     let cli = Cli::parse();
     wait_for_server(&cli.addr).await?;
-    progress_tui_client::run(cli.addr).await
+    progress_tui_client::run_with_redraw_interval(cli.addr, REFRESH_INTERVAL).await
 }
 
 async fn wait_for_server(addr: &str) -> io::Result<()> {
