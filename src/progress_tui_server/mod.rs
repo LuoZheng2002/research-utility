@@ -9,8 +9,8 @@ use tokio::sync::{broadcast, oneshot};
 
 use crate::message::{Severity, TuiMessage};
 use crate::progress_tui_protocol::{
-    ProgressClientMessage, ProgressServerMessage, ProgressStats, progress_screen_server_addr,
-    framed_reader, framed_writer, read_framed_message, send_framed_message,
+    ProgressClientMessage, ProgressServerMessage, ProgressStats, framed_reader, framed_writer,
+    read_framed_message, send_framed_message,
 };
 
 const SERVER_BROADCAST_CHANNEL_CAPACITY: usize = 1024;
@@ -36,6 +36,7 @@ pub struct ProgressTuiServer;
 
 impl ProgressTuiServer {
     pub async fn initialize<F>(
+        port: u16,
         log_file: Option<String>,
         client_command_handler: F,
     ) -> io::Result<()>
@@ -69,7 +70,7 @@ impl ProgressTuiServer {
         let config = RunConfig {
             client_command_handler: Arc::new(client_command_handler),
         };
-        let listener = TcpListener::bind(progress_screen_server_addr()).await?;
+        let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await?;
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let state_for_task = Arc::clone(&state);
 

@@ -1,19 +1,34 @@
 use std::io;
 use std::time::Duration;
 
+use clap::Parser;
 use research_utility::message::{Severity, TuiMessage};
+use research_utility::progress_tui_protocol::DEFAULT_PROGRESS_SCREEN_TCP_PORT;
 use research_utility::progress_tui_server::ProgressTuiServer;
 use research_utility::progress_tui_server::{
     log_key_value_pair, log_master_progress, log_message, log_worker_progress,
 };
 
+#[derive(Debug, Parser)]
+#[command(name = "bin_test_progress_tui_server")]
+#[command(about = "Generates progress events for TUI server testing")]
+struct Cli {
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PROGRESS_SCREEN_TCP_PORT,
+        help = "TCP port for progress TUI server"
+    )]
+    tui_server_port: u16,
+}
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    let cli = Cli::parse();
     let num_workers = 6;
     let steps_per_worker = 40;
 
     let log_file = Some("test.log".to_string());
-    ProgressTuiServer::initialize(log_file, |_command| {}).await?;
+    ProgressTuiServer::initialize(cli.tui_server_port, log_file, |_command| {}).await?;
     simulate_progress(num_workers, steps_per_worker).await;
     ProgressTuiServer::shutdown().await
 }

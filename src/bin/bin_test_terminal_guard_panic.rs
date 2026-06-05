@@ -1,13 +1,28 @@
 use std::io;
 use std::time::Duration;
 
+use clap::Parser;
+use research_utility::progress_tui_protocol::DEFAULT_PROGRESS_SCREEN_TCP_PORT;
 use research_utility::progress_tui_server::{
     ProgressTuiServer, log_key_value_pair, log_worker_progress,
 };
 
+#[derive(Debug, Parser)]
+#[command(name = "bin_test_terminal_guard_panic")]
+#[command(about = "Triggers a panic path in progress TUI handling")]
+struct Cli {
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PROGRESS_SCREEN_TCP_PORT,
+        help = "TCP port for progress TUI server"
+    )]
+    tui_server_port: u16,
+}
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    ProgressTuiServer::initialize(None, |_command| {}).await?;
+    let cli = Cli::parse();
+    ProgressTuiServer::initialize(cli.tui_server_port, None, |_command| {}).await?;
 
     log_key_value_pair(
         "status".to_string(),
