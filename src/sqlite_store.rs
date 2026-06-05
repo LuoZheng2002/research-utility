@@ -93,8 +93,22 @@ where
             .contains("locking protocol")
     }
 
-    fn open_connection(db_path: &PathBuf, create_if_missing: bool) -> Result<Connection, String> {
-        let flags = if create_if_missing {
+    fn open_connection(
+        db_path: &PathBuf,
+        create_if_missing: bool,
+        readonly: bool,
+    ) -> Result<Connection, String> {
+        if create_if_missing && readonly {
+            return Err(format!(
+                "Cannot create sqlite database {} in readonly mode for table {}",
+                db_path.display(),
+                SQLITE_STORE_TABLE_NAME
+            ));
+        }
+
+        let flags = if readonly {
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI
+        } else if create_if_missing {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
                 | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
                 | rusqlite::OpenFlags::SQLITE_OPEN_URI
@@ -120,37 +134,39 @@ where
                     e
                 )
             })?;
-        match connection.pragma_update(None, "journal_mode", "WAL") {
-            Ok(()) => {}
-            Err(error) if Self::is_locking_protocol_error(&error) => {
-                connection
-                    .pragma_update(None, "journal_mode", "DELETE")
-                    .map_err(|fallback_error| {
-                        format!(
-                            "Failed to set sqlite journal_mode on {} (WAL error: {}; DELETE fallback error: {})",
-                            db_path.display(),
-                            error,
-                            fallback_error
-                        )
-                    })?;
+        if !readonly {
+            match connection.pragma_update(None, "journal_mode", "WAL") {
+                Ok(()) => {}
+                Err(error) if Self::is_locking_protocol_error(&error) => {
+                    connection
+                        .pragma_update(None, "journal_mode", "DELETE")
+                        .map_err(|fallback_error| {
+                            format!(
+                                "Failed to set sqlite journal_mode on {} (WAL error: {}; DELETE fallback error: {})",
+                                db_path.display(),
+                                error,
+                                fallback_error
+                            )
+                        })?;
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "Failed to set sqlite journal_mode on {}: {}",
+                        db_path.display(),
+                        error
+                    ));
+                }
             }
-            Err(error) => {
-                return Err(format!(
-                    "Failed to set sqlite journal_mode on {}: {}",
-                    db_path.display(),
-                    error
-                ));
-            }
+            connection
+                .pragma_update(None, "synchronous", "NORMAL")
+                .map_err(|e| {
+                    format!(
+                        "Failed to set sqlite synchronous pragma on {}: {}",
+                        db_path.display(),
+                        e
+                    )
+                })?;
         }
-        connection
-            .pragma_update(None, "synchronous", "NORMAL")
-            .map_err(|e| {
-                format!(
-                    "Failed to set sqlite synchronous pragma on {}: {}",
-                    db_path.display(),
-                    e
-                )
-            })?;
 
         Ok(connection)
     }
@@ -238,7 +254,7 @@ where
             })?;
         }
 
-        let connection = Self::open_connection(&db_path, true)?;
+        let connection = Self::open_connection(&db_path, true, false)?;
         Self::create_table_if_missing(&connection, &db_path)?;
         Ok(Self {
             db_path,
@@ -248,7 +264,7 @@ where
         })
     }
 
-    pub fn assume_initialized(db_path: impl Into<PathBuf>) -> Result<Self, String> {
+    pub fn assume_initialized(db_path: impl Into<PathBuf>, readonly: bool) -> Result<Self, String> {
         let db_path = db_path.into();
         if !db_path.exists() {
             return Err(format!(
@@ -257,7 +273,7 @@ where
                 SQLITE_STORE_TABLE_NAME
             ));
         }
-        let connection = Self::open_connection(&db_path, false)?;
+        let connection = Self::open_connection(&db_path, false, readonly)?;
         if !Self::table_exists_sync(&connection, &db_path)? {
             return Err(format!(
                 "Expected sqlite table {} to exist in {} when assuming initialized",
@@ -273,10 +289,19 @@ where
         })
     }
 
-    pub fn initialize_if_missing(db_path: impl Into<PathBuf>) -> Result<Self, String> {
+    pub fn initialize_if_missing(
+        db_path: impl Into<PathBuf>,
+        readonly: bool,
+    ) -> Result<Self, String> {
         let db_path = db_path.into();
         if db_path.exists() {
-            Self::assume_initialized(db_path)
+            Self::assume_initialized(db_path, readonly)
+        } else if readonly {
+            Err(format!(
+                "Expected sqlite database {} to exist before opening readonly table {}",
+                db_path.display(),
+                SQLITE_STORE_TABLE_NAME
+            ))
         } else {
             Self::initialize(db_path)
         }
