@@ -46,6 +46,12 @@ impl ProgressTuiServer {
         if PROGRESS_TUI_SERVER_STATE.load_full().is_some() {
             return Ok(());
         }
+        // create the parent dir
+        if let Some(log_file) = &log_file {
+            if let Some(parent) = std::path::Path::new(log_file).parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
 
         let log_file_writer = log_file
             .map(|path| {
