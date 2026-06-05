@@ -85,6 +85,13 @@ where
     K: SqliteTableArrayKey,
     V: Serialize + DeserializeOwned,
 {
+    fn is_locking_protocol_error(error: &RusqliteError) -> bool {
+        error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("locking protocol")
+    }
+
     fn open_connection(db_path: &PathBuf, create_if_missing: bool) -> Result<Connection, String> {
         let flags = if create_if_missing {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -111,15 +118,28 @@ where
                     e
                 )
             })?;
-        connection
-            .pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| {
-                format!(
+        match connection.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => {}
+            Err(error) if Self::is_locking_protocol_error(&error) => {
+                connection
+                    .pragma_update(None, "journal_mode", "DELETE")
+                    .map_err(|fallback_error| {
+                        format!(
+                            "Failed to set sqlite journal_mode on {} (WAL error: {}; DELETE fallback error: {})",
+                            db_path.display(),
+                            error,
+                            fallback_error
+                        )
+                    })?;
+            }
+            Err(error) => {
+                return Err(format!(
                     "Failed to set sqlite journal_mode on {}: {}",
                     db_path.display(),
-                    e
-                )
-            })?;
+                    error
+                ));
+            }
+        }
         connection
             .pragma_update(None, "synchronous", "NORMAL")
             .map_err(|e| {
@@ -366,50 +386,52 @@ where
         ))
     }
 
-    pub fn initialize(db_path: impl Into<PathBuf>) -> Self {
+    pub fn initialize(db_path: impl Into<PathBuf>) -> Result<Self, String> {
         let db_path = db_path.into();
-        assert!(
-            !db_path.exists(),
-            "Expected sqlite database {} to not exist when initializing sqlite table array store",
-            db_path.display()
-        );
+        if db_path.exists() {
+            return Err(format!(
+                "Expected sqlite database {} to not exist when initializing sqlite table array store",
+                db_path.display()
+            ));
+        }
         if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent).unwrap_or_else(|e| {
-                panic!(
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!(
                     "Failed to create parent directory for sqlite database {}: {}",
                     db_path.display(),
                     e
                 )
-            });
+            })?;
         }
 
-        let connection = Self::open_connection(&db_path, true).unwrap_or_else(|e| panic!("{}", e));
-        Self {
+        let connection = Self::open_connection(&db_path, true)?;
+        Ok(Self {
             db_path,
             connection,
             key_marker: PhantomData,
             value_marker: PhantomData,
-        }
+        })
     }
 
-    pub fn assume_initialized(db_path: impl Into<PathBuf>) -> Self {
+    pub fn assume_initialized(db_path: impl Into<PathBuf>) -> Result<Self, String> {
         let db_path = db_path.into();
-        assert!(
-            db_path.exists(),
-            "Expected sqlite database {} to exist before assuming sqlite table array store is initialized",
-            db_path.display()
-        );
+        if !db_path.exists() {
+            return Err(format!(
+                "Expected sqlite database {} to exist before assuming sqlite table array store is initialized",
+                db_path.display()
+            ));
+        }
 
-        let connection = Self::open_connection(&db_path, false).unwrap_or_else(|e| panic!("{}", e));
-        Self {
+        let connection = Self::open_connection(&db_path, false)?;
+        Ok(Self {
             db_path,
             connection,
             key_marker: PhantomData,
             value_marker: PhantomData,
-        }
+        })
     }
 
-    pub fn initialize_if_missing(db_path: impl Into<PathBuf>) -> Self {
+    pub fn initialize_if_missing(db_path: impl Into<PathBuf>) -> Result<Self, String> {
         let db_path = db_path.into();
         if db_path.exists() {
             Self::assume_initialized(db_path)
@@ -419,7 +441,7 @@ where
     }
 
     pub fn new(db_path: impl Into<PathBuf>) -> Result<Self, String> {
-        Ok(Self::initialize_if_missing(db_path))
+        Self::initialize_if_missing(db_path)
     }
 
     pub fn append(&self, table_key: K, value: &V) -> Result<(), String> {

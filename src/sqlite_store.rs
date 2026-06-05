@@ -86,6 +86,13 @@ where
     K: SqliteStoreKey,
     V: Serialize + DeserializeOwned,
 {
+    fn is_locking_protocol_error(error: &RusqliteError) -> bool {
+        error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("locking protocol")
+    }
+
     fn open_connection(db_path: &PathBuf, create_if_missing: bool) -> Result<Connection, String> {
         let flags = if create_if_missing {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -113,15 +120,28 @@ where
                     e
                 )
             })?;
-        connection
-            .pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| {
-                format!(
+        match connection.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => {}
+            Err(error) if Self::is_locking_protocol_error(&error) => {
+                connection
+                    .pragma_update(None, "journal_mode", "DELETE")
+                    .map_err(|fallback_error| {
+                        format!(
+                            "Failed to set sqlite journal_mode on {} (WAL error: {}; DELETE fallback error: {})",
+                            db_path.display(),
+                            error,
+                            fallback_error
+                        )
+                    })?;
+            }
+            Err(error) => {
+                return Err(format!(
                     "Failed to set sqlite journal_mode on {}: {}",
                     db_path.display(),
-                    e
-                )
-            })?;
+                    error
+                ));
+            }
+        }
         connection
             .pragma_update(None, "synchronous", "NORMAL")
             .map_err(|e| {
@@ -155,26 +175,26 @@ where
         Duration::from_millis(base_delay_ms * (1_u64 << shift))
     }
 
-    fn table_exists_sync(connection: &Connection, db_path: &PathBuf) -> bool {
-        let existing_table_name: Option<String> = connection
+    fn table_exists_sync(connection: &Connection, db_path: &PathBuf) -> Result<bool, String> {
+        let existing_table_name: Result<Option<String>, String> = connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
                 params![SQLITE_STORE_TABLE_NAME],
                 |row| row.get(0),
             )
             .optional()
-            .unwrap_or_else(|e| {
-                panic!(
+            .map_err(|e| {
+                format!(
                     "Failed to query sqlite_master for table {} in {}: {}",
                     SQLITE_STORE_TABLE_NAME,
                     db_path.display(),
                     e
                 )
             });
-        existing_table_name.is_some()
+        Ok(existing_table_name?.is_some())
     }
 
-    fn create_table_if_missing(connection: &Connection, db_path: &PathBuf) {
+    fn create_table_if_missing(connection: &Connection, db_path: &PathBuf) -> Result<(), String> {
         connection
             .execute(
                 &format!(
@@ -188,69 +208,72 @@ where
                 ),
                 [],
             )
-            .unwrap_or_else(|e| {
-                panic!(
+            .map_err(|e| {
+                format!(
                     "Failed to initialize sqlite table {} in {}: {}",
                     SQLITE_STORE_TABLE_NAME,
                     db_path.display(),
                     e
                 )
-            });
+            })
+            .map(|_| ())
     }
 
-    pub fn initialize(db_path: impl Into<PathBuf>) -> Self {
+    pub fn initialize(db_path: impl Into<PathBuf>) -> Result<Self, String> {
         let db_path = db_path.into();
-        assert!(
-            !db_path.exists(),
-            "Expected sqlite database {} to not exist when initializing table {}",
-            db_path.display(),
-            SQLITE_STORE_TABLE_NAME
-        );
+        if db_path.exists() {
+            return Err(format!(
+                "Expected sqlite database {} to not exist when initializing table {}",
+                db_path.display(),
+                SQLITE_STORE_TABLE_NAME
+            ));
+        }
         if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent).unwrap_or_else(|e| {
-                panic!(
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!(
                     "Failed to create parent directory for sqlite database {}: {}",
                     db_path.display(),
                     e
                 )
-            });
+            })?;
         }
 
-        let connection = Self::open_connection(&db_path, true).unwrap_or_else(|e| panic!("{}", e));
-        Self::create_table_if_missing(&connection, &db_path);
-        Self {
+        let connection = Self::open_connection(&db_path, true)?;
+        Self::create_table_if_missing(&connection, &db_path)?;
+        Ok(Self {
             db_path,
             connection,
             key_marker: PhantomData,
             value_marker: PhantomData,
-        }
+        })
     }
 
-    pub fn assume_initialized(db_path: impl Into<PathBuf>) -> Self {
+    pub fn assume_initialized(db_path: impl Into<PathBuf>) -> Result<Self, String> {
         let db_path = db_path.into();
-        assert!(
-            db_path.exists(),
-            "Expected sqlite database {} to exist before assuming table {} is initialized",
-            db_path.display(),
-            SQLITE_STORE_TABLE_NAME
-        );
-        let connection =
-            Self::open_connection(&db_path, false).unwrap_or_else(|e| panic!("{}", e));
-        assert!(
-            Self::table_exists_sync(&connection, &db_path),
-            "Expected sqlite table {} to exist in {} when assuming initialized",
-            SQLITE_STORE_TABLE_NAME,
-            db_path.display()
-        );
-        Self {
+        if !db_path.exists() {
+            return Err(format!(
+                "Expected sqlite database {} to exist before assuming table {} is initialized",
+                db_path.display(),
+                SQLITE_STORE_TABLE_NAME
+            ));
+        }
+        let connection = Self::open_connection(&db_path, false)?;
+        if !Self::table_exists_sync(&connection, &db_path)? {
+            return Err(format!(
+                "Expected sqlite table {} to exist in {} when assuming initialized",
+                SQLITE_STORE_TABLE_NAME,
+                db_path.display()
+            ));
+        }
+        Ok(Self {
             db_path,
             connection,
             key_marker: PhantomData,
             value_marker: PhantomData,
-        }
+        })
     }
 
-    pub fn initialize_if_missing(db_path: impl Into<PathBuf>) -> Self {
+    pub fn initialize_if_missing(db_path: impl Into<PathBuf>) -> Result<Self, String> {
         let db_path = db_path.into();
         if db_path.exists() {
             Self::assume_initialized(db_path)
