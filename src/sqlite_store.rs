@@ -116,14 +116,26 @@ where
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI
         };
 
-        let connection = Connection::open_with_flags(db_path, flags).map_err(|e| {
-            format!(
-                "Failed to open sqlite database {} for table {}: {}",
-                db_path.display(),
-                SQLITE_STORE_TABLE_NAME,
-                e
-            )
-        })?;
+        let connection = if readonly {
+            let sqlite_uri = format!("file:{}?mode=ro&immutable=1", db_path.display());
+            Connection::open_with_flags(&sqlite_uri, flags).map_err(|e| {
+                format!(
+                    "Failed to open sqlite database {} for table {} in readonly immutable mode: {}",
+                    db_path.display(),
+                    SQLITE_STORE_TABLE_NAME,
+                    e
+                )
+            })?
+        } else {
+            Connection::open_with_flags(db_path, flags).map_err(|e| {
+                format!(
+                    "Failed to open sqlite database {} for table {}: {}",
+                    db_path.display(),
+                    SQLITE_STORE_TABLE_NAME,
+                    e
+                )
+            })?
+        };
 
         connection
             .busy_timeout(Duration::from_secs(SQLITE_BUSY_TIMEOUT_SECS))
