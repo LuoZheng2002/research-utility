@@ -23,6 +23,10 @@ impl<T> BincodeLogFile<T>
 where
     T: Serialize + DeserializeOwned,
 {
+    fn is_unexpected_eof_message(message: &str) -> bool {
+        message.contains("unexpected end of file") || message.contains("failed to fill whole buffer")
+    }
+
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, String> {
         Self::open_with_cache_capacity(path, DEFAULT_CACHE_CAPACITY)
     }
@@ -341,6 +345,55 @@ where
                 break;
             }
 
+            let payload_start = offset;
+            let next_offset = offset
+                .checked_add(payload_len)
+                .ok_or_else(|| format!("Byte offset overflow while scanning {}", path.display()))?;
+
+            if next_offset == file_size {
+                let payload_len_usize = usize::try_from(payload_len).map_err(|_| {
+                    format!(
+                        "Payload length {} at offset {} exceeds usize in {}",
+                        payload_len,
+                        record_start,
+                        path.display()
+                    )
+                })?;
+                let mut payload = vec![0_u8; payload_len_usize];
+                file.read_exact(&mut payload).map_err(|e| {
+                    format!(
+                        "Failed to read tail payload of {} bytes at offset {} in {}: {}",
+                        payload_len,
+                        payload_start,
+                        path.display(),
+                        e
+                    )
+                })?;
+
+                match bincode::deserialize::<T>(&payload) {
+                    Ok(_) => {
+                        offset = next_offset;
+                        count = count.checked_add(1).ok_or_else(|| {
+                            format!("Item count overflow while scanning {}", path.display())
+                        })?;
+                    }
+                    Err(e) => {
+                        let message = e.to_string();
+                        if Self::is_unexpected_eof_message(&message) {
+                            offset = record_start;
+                            break;
+                        }
+                        return Err(format!(
+                            "Corrupted bincode log {}: failed to deserialize tail item at offset {}: {}",
+                            path.display(),
+                            record_start,
+                            message
+                        ));
+                    }
+                }
+                continue;
+            }
+
             let payload_len_i64 = i64::try_from(payload_len)
                 .map_err(|_| format!("Payload length too large in {}", path.display()))?;
             file.seek(SeekFrom::Current(payload_len_i64)).map_err(|e| {
@@ -352,9 +405,7 @@ where
                 )
             })?;
 
-            offset = offset
-                .checked_add(payload_len)
-                .ok_or_else(|| format!("Byte offset overflow while scanning {}", path.display()))?;
+            offset = next_offset;
             count = count
                 .checked_add(1)
                 .ok_or_else(|| format!("Item count overflow while scanning {}", path.display()))?;
@@ -565,6 +616,37 @@ mod tests {
         std::fs::write(&path, [7_u8, 8, 9]).expect("failed to seed file");
 
         let log = BincodeLogFile::<TestItem>::open(&path).expect("open should tolerate partial tail");
+        assert_eq!(log.len(), 0);
+
+        drop(log);
+        std::fs::remove_file(&path).expect("failed to remove temporary file");
+    }
+
+    #[test]
+    fn open_ignores_truncated_tail_record_with_matching_length_prefix() {
+        let path = temp_file_path("truncated_tail_record");
+        let item = TestItem {
+            id: 7,
+            text: "abcdef".to_string(),
+        };
+        let payload = bincode::serialize(&item).expect("failed to serialize item");
+        let truncated_len = payload.len() / 2;
+
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .expect("failed to create test file");
+            file.write_all(&(u64::try_from(truncated_len).expect("len conversion failed")).to_le_bytes())
+                .expect("failed to write length");
+            file.write_all(&payload[..truncated_len])
+                .expect("failed to write truncated payload");
+            file.flush().expect("failed to flush file");
+        }
+
+        let log = BincodeLogFile::<TestItem>::open(&path).expect("open should tolerate truncated tail item");
         assert_eq!(log.len(), 0);
 
         drop(log);
