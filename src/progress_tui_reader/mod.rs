@@ -352,12 +352,21 @@ impl ReplayEngine {
         };
 
         for frame_index in start_frame..=target {
-            let frame = self.log.get(frame_index)?.ok_or_else(|| {
-                format!(
-                    "Missing frame {} while reconstructing replay (len={})",
-                    frame_index, self.frame_count
-                )
-            })?;
+            let Some(frame) = self.log.get(frame_index)? else {
+                self.frame_count = frame_index;
+                if self.frame_count == 0 {
+                    self.current_frame = 0;
+                    self.state_cache.clear();
+                    return Ok(None);
+                }
+
+                if self.current_frame >= self.frame_count {
+                    self.current_frame = self.frame_count - 1;
+                }
+                self.state_cache.clear();
+                self.state_cache.put(self.current_frame, state.clone());
+                return Ok(Some(state));
+            };
             state.apply_frame(frame);
 
             if frame_index % CACHE_STRIDE == 0 || frame_index == target {

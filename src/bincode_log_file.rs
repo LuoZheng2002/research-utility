@@ -24,7 +24,9 @@ where
     T: Serialize + DeserializeOwned,
 {
     fn is_unexpected_eof_message(message: &str) -> bool {
-        message.contains("unexpected end of file") || message.contains("failed to fill whole buffer")
+        message.contains("unexpected end of file")
+            || message.contains("failed to fill whole buffer")
+            || message.starts_with("io error")
     }
 
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, String> {
@@ -146,8 +148,7 @@ where
         }
 
         let offset = self.offset_for_index(index)?;
-        let value = self.read_value_at_offset(offset)?;
-        Ok(Some(value))
+        self.read_value_at_offset(offset)
     }
 
     pub fn len(&self) -> usize {
@@ -257,7 +258,7 @@ where
             .ok_or_else(|| format!("Byte offset overflow in {}", self.path.display()))
     }
 
-    fn read_value_at_offset(&mut self, offset: u64) -> Result<T, String> {
+    fn read_value_at_offset(&mut self, offset: u64) -> Result<Option<T>, String> {
         self.file.seek(SeekFrom::Start(offset)).map_err(|e| {
             format!(
                 "Failed to seek {} to offset {}: {}",
@@ -298,14 +299,21 @@ where
             )
         })?;
 
-        bincode::deserialize::<T>(&payload).map_err(|e| {
-            format!(
-                "Failed to bincode-deserialize item at offset {} in {}: {}",
-                offset,
-                self.path.display(),
-                e
-            )
-        })
+        match bincode::deserialize::<T>(&payload) {
+            Ok(value) => Ok(Some(value)),
+            Err(e) => {
+                let message = e.to_string();
+                if Self::is_unexpected_eof_message(&message) {
+                    return Ok(None);
+                }
+                Err(format!(
+                    "Failed to bincode-deserialize item at offset {} in {}: {}",
+                    offset,
+                    self.path.display(),
+                    message
+                ))
+            }
+        }
     }
 
     fn scan_len_and_tail(file: &mut File, path: &PathBuf) -> Result<(usize, u64), String> {
@@ -648,6 +656,48 @@ mod tests {
 
         let log = BincodeLogFile::<TestItem>::open(&path).expect("open should tolerate truncated tail item");
         assert_eq!(log.len(), 0);
+
+        drop(log);
+        std::fs::remove_file(&path).expect("failed to remove temporary file");
+    }
+
+    #[test]
+    fn get_treats_unexpected_eof_deserialize_as_missing_item() {
+        let path = temp_file_path("unexpected_eof_deserialize_get");
+        let bad_item = TestItem {
+            id: 11,
+            text: "this payload is intentionally truncated".to_string(),
+        };
+        let good_item = TestItem {
+            id: 12,
+            text: "good".to_string(),
+        };
+        let bad_payload = bincode::serialize(&bad_item).expect("failed to serialize bad item");
+        let bad_len = bad_payload.len() / 2;
+        let good_payload = bincode::serialize(&good_item).expect("failed to serialize good item");
+
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .expect("failed to create test file");
+            file.write_all(&(u64::try_from(bad_len).expect("bad len conversion failed")).to_le_bytes())
+                .expect("failed to write bad length");
+            file.write_all(&bad_payload[..bad_len])
+                .expect("failed to write bad payload");
+            file.write_all(&(u64::try_from(good_payload.len()).expect("good len conversion failed")).to_le_bytes())
+                .expect("failed to write good length");
+            file.write_all(&good_payload)
+                .expect("failed to write good payload");
+            file.flush().expect("failed to flush file");
+        }
+
+        let mut log = BincodeLogFile::<TestItem>::open(&path).expect("failed to open log");
+        assert_eq!(log.len(), 2);
+        assert_eq!(log.get(0).expect("get bad index failed"), None);
+        assert_eq!(log.get(1).expect("get good index failed"), Some(good_item));
 
         drop(log);
         std::fs::remove_file(&path).expect("failed to remove temporary file");
