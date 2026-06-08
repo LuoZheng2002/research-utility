@@ -129,6 +129,13 @@ where
         Ok(())
     }
 
+    pub fn append_and_flush(&mut self, item: &T) -> Result<(), String> {
+        self.append(item)?;
+        self.file
+            .flush()
+            .map_err(|e| format!("Failed to flush {}: {}", self.path.display(), e))
+    }
+
     pub fn get(&mut self, index: usize) -> Result<Option<T>, String> {
         if index >= self.len {
             return Ok(None);

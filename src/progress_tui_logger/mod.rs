@@ -384,7 +384,7 @@ fn flush_frame_if_needed(state: &Arc<ProgressTuiLoggerState>) -> io::Result<()> 
     {
         let mut log_file = state.log_file.lock();
         log_file
-            .append(&frame)
+            .append_and_flush(&frame)
             .map_err(|e| io::Error::other(format!("failed to append log frame: {e}")))?;
     }
     *state.last_flushed_snapshot.lock() = snapshot;
