@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,7 @@ pub struct ProgressLogLine {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProgressLogFrame {
+    pub elapsed_seconds: f64,
     pub state: Option<String>,
     pub window_name: Option<String>,
     pub exit_hint: Option<String>,
@@ -172,6 +173,7 @@ impl ProgressSnapshot {
         };
 
         ProgressLogFrame {
+            elapsed_seconds: 0.0,
             state,
             window_name,
             exit_hint,
@@ -185,6 +187,7 @@ impl ProgressSnapshot {
 }
 
 struct ProgressTuiLoggerState {
+    start_instant: Instant,
     snapshot: parking_lot::Mutex<ProgressSnapshot>,
     pending_log_lines: parking_lot::Mutex<Vec<ProgressLogLine>>,
     log_file: parking_lot::Mutex<BincodeLogFile<ProgressLogFrame>>,
@@ -218,6 +221,7 @@ impl ProgressTuiLogger {
             .map_err(|e| io::Error::other(format!("failed to open progress log file: {e}")))?;
 
         let state = Arc::new(ProgressTuiLoggerState {
+            start_instant: Instant::now(),
             snapshot: parking_lot::Mutex::new(ProgressSnapshot::default()),
             pending_log_lines: parking_lot::Mutex::new(Vec::new()),
             log_file: parking_lot::Mutex::new(log_file),
@@ -370,7 +374,8 @@ fn flush_frame_if_needed(state: &Arc<ProgressTuiLoggerState>) -> io::Result<()> 
         std::mem::take(&mut *guard)
     };
     let previous = state.last_flushed_snapshot.lock().clone();
-    let frame = snapshot.delta_from(&previous, log_lines);
+    let mut frame = snapshot.delta_from(&previous, log_lines);
+    frame.elapsed_seconds = state.start_instant.elapsed().as_secs_f64();
 
     if frame.is_empty() {
         return Ok(());

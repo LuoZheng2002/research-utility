@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crossterm::{
     event::{
@@ -28,10 +28,11 @@ use crate::progress_tui_logger::{ProgressGaugeState, ProgressLogFrame};
 
 const WINDOW_TITLE: &str = "Progress Screen";
 const DEFAULT_REDRAW_INTERVAL: Duration = Duration::from_millis(100);
+const FRAME_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_LOG_LINES: usize = 100;
 const KEY_ORDER: &[&str] = &["status"];
-const SPEED_STEP_FRAMES_PER_SECOND: i32 = 2;
-const DEFAULT_SPEED_FRAMES_PER_SECOND: i32 = 2;
+const SPEED_STEP_FRAMES_PER_HALF_SECOND: i32 = 1;
+const DEFAULT_SPEED_FRAMES_PER_HALF_SECOND: i32 = 1;
 const CACHE_CAPACITY: usize = 48;
 const CACHE_STRIDE: usize = 20;
 
@@ -53,28 +54,29 @@ pub async fn run_with_redraw_interval(
     let mut screen_state = ProgressScreenState::new();
 
     let mut redraw_interval = tokio::time::interval(redraw_interval_duration);
-    let mut last_tick = Instant::now();
+    let mut frame_update_interval = tokio::time::interval(FRAME_UPDATE_INTERVAL);
 
     loop {
-        redraw_interval.tick().await;
-        let now = Instant::now();
-        let delta_seconds = now.duration_since(last_tick).as_secs_f64();
-        last_tick = now;
+        tokio::select! {
+            _ = redraw_interval.tick() => {
+                let actions = handle_input_events(&mut screen_state)?;
+                if actions.quit {
+                    break;
+                }
+                replay.apply_actions(actions);
 
-        let actions = handle_input_events(&mut screen_state)?;
-        if actions.quit {
-            break;
+                if let Some(frame_state) = replay.current_frame_state().map_err(io::Error::other)? {
+                    screen_state.apply_replay_state(frame_state);
+                } else {
+                    screen_state.apply_replay_state(ReplayFrameState::default());
+                }
+
+                draw(&mut terminal, &mut screen_state, replay.playback_status())?;
+            }
+            _ = frame_update_interval.tick() => {
+                replay.advance(1).map_err(io::Error::other)?;
+            }
         }
-        replay.apply_actions(actions);
-        replay.advance(delta_seconds).map_err(io::Error::other)?;
-
-        if let Some(frame_state) = replay.current_frame_state().map_err(io::Error::other)? {
-            screen_state.apply_replay_state(frame_state);
-        } else {
-            screen_state.apply_replay_state(ReplayFrameState::default());
-        }
-
-        draw(&mut terminal, &mut screen_state, replay.playback_status())?;
     }
 
     Ok(())
@@ -82,6 +84,7 @@ pub async fn run_with_redraw_interval(
 
 #[derive(Debug, Clone)]
 struct ReplayFrameState {
+    elapsed_seconds: f64,
     state_text: String,
     window_name: String,
     exit_hint: String,
@@ -94,6 +97,7 @@ struct ReplayFrameState {
 impl Default for ReplayFrameState {
     fn default() -> Self {
         Self {
+            elapsed_seconds: 0.0,
             state_text: String::new(),
             window_name: WINDOW_TITLE.to_string(),
             exit_hint: "Reader active. Ctrl+C to exit.".to_string(),
@@ -110,6 +114,7 @@ impl Default for ReplayFrameState {
 
 impl ReplayFrameState {
     fn apply_frame(&mut self, frame: ProgressLogFrame) {
+        self.elapsed_seconds = frame.elapsed_seconds;
         if let Some(state) = frame.state {
             self.state_text = state;
         }
@@ -147,8 +152,7 @@ struct ReplayEngine {
     log: BincodeLogFile<ProgressLogFrame>,
     frame_count: usize,
     current_frame: usize,
-    frame_accumulator: f64,
-    play_speed_frames_per_second: i32,
+    play_speed_frames_per_half_second: i32,
     is_paused: bool,
     pause_at_end_resume_speed: i32,
     auto_paused_at_end: bool,
@@ -165,10 +169,9 @@ impl ReplayEngine {
             log,
             frame_count,
             current_frame: 0,
-            frame_accumulator: 0.0,
-            play_speed_frames_per_second: DEFAULT_SPEED_FRAMES_PER_SECOND,
+            play_speed_frames_per_half_second: DEFAULT_SPEED_FRAMES_PER_HALF_SECOND,
             is_paused: false,
-            pause_at_end_resume_speed: DEFAULT_SPEED_FRAMES_PER_SECOND,
+            pause_at_end_resume_speed: DEFAULT_SPEED_FRAMES_PER_HALF_SECOND,
             auto_paused_at_end: false,
             state_cache: LruCache::new(capacity),
         })
@@ -177,60 +180,67 @@ impl ReplayEngine {
     fn apply_actions(&mut self, actions: InputActions) {
         if actions.toggle_pause {
             self.is_paused = true;
-            self.play_speed_frames_per_second = 0;
+            self.play_speed_frames_per_half_second = 0;
             self.auto_paused_at_end = false;
-            self.frame_accumulator = 0.0;
         }
         if actions.speed_delta_steps != 0 {
-            self.play_speed_frames_per_second +=
-                actions.speed_delta_steps * SPEED_STEP_FRAMES_PER_SECOND;
+            self.play_speed_frames_per_half_second +=
+                actions.speed_delta_steps * SPEED_STEP_FRAMES_PER_HALF_SECOND;
             self.is_paused = false;
             self.auto_paused_at_end = false;
-            if self.play_speed_frames_per_second > 0 {
-                self.pause_at_end_resume_speed = self.play_speed_frames_per_second;
+            if self.play_speed_frames_per_half_second > 0 {
+                self.pause_at_end_resume_speed = self.play_speed_frames_per_half_second;
             }
         }
     }
 
-    fn advance(&mut self, delta_seconds: f64) -> Result<(), String> {
+    fn advance(&mut self, delta_frames: usize) -> Result<(), String> {
         self.refresh_if_on_last_frame()?;
 
-        if self.is_paused || self.play_speed_frames_per_second == 0 || self.frame_count == 0 {
+        if self.is_paused
+            || self.play_speed_frames_per_half_second == 0
+            || self.frame_count == 0
+            || delta_frames == 0
+        {
             return Ok(());
         }
 
-        self.frame_accumulator += self.play_speed_frames_per_second as f64 * delta_seconds;
+        let delta_frames_i64 = i64::try_from(delta_frames)
+            .map_err(|_| "delta_frames exceeds i64 range".to_string())?;
+        let speed = i64::from(self.play_speed_frames_per_half_second);
+        let frame_delta = speed
+            .checked_mul(delta_frames_i64)
+            .ok_or_else(|| "frame delta overflow".to_string())?;
+        let current = i64::try_from(self.current_frame)
+            .map_err(|_| "current_frame exceeds i64 range".to_string())?;
+        let mut target = current
+            .checked_add(frame_delta)
+            .ok_or_else(|| "target frame overflow".to_string())?;
 
-        while self.frame_accumulator >= 1.0 {
-            if self.current_frame + 1 >= self.frame_count {
-                let before = self.frame_count;
-                self.refresh_if_on_last_frame()?;
-                if self.current_frame + 1 >= self.frame_count {
-                    self.is_paused = true;
-                    self.auto_paused_at_end = true;
-                    if self.play_speed_frames_per_second > 0 {
-                        self.pause_at_end_resume_speed = self.play_speed_frames_per_second;
-                    }
-                    self.play_speed_frames_per_second = 0;
-                    self.frame_accumulator = 0.0;
-                    break;
-                }
-                if self.frame_count > before {
-                    self.auto_paused_at_end = false;
-                }
-            }
-            self.current_frame += 1;
-            self.frame_accumulator -= 1.0;
+        if target < 0 {
+            target = 0;
         }
 
-        while self.frame_accumulator <= -1.0 {
-            if self.current_frame == 0 {
-                self.frame_accumulator = 0.0;
-                break;
+        let last_frame = i64::try_from(self.frame_count - 1)
+            .map_err(|_| "frame_count exceeds i64 range".to_string())?;
+        if target > last_frame {
+            self.refresh_if_on_last_frame()?;
+            let refreshed_last_frame = i64::try_from(self.frame_count - 1)
+                .map_err(|_| "frame_count exceeds i64 range".to_string())?;
+            if target > refreshed_last_frame {
+                self.current_frame = self.frame_count - 1;
+                self.is_paused = true;
+                self.auto_paused_at_end = true;
+                if self.play_speed_frames_per_half_second > 0 {
+                    self.pause_at_end_resume_speed = self.play_speed_frames_per_half_second;
+                }
+                self.play_speed_frames_per_half_second = 0;
+                return Ok(());
             }
-            self.current_frame -= 1;
-            self.frame_accumulator += 1.0;
         }
+
+        self.current_frame = usize::try_from(target)
+            .map_err(|_| "target frame is negative or exceeds usize range".to_string())?;
 
         Ok(())
     }
@@ -249,7 +259,7 @@ impl ReplayEngine {
             }
 
             if self.auto_paused_at_end && self.frame_count > previous_len {
-                self.play_speed_frames_per_second = self.pause_at_end_resume_speed.max(1);
+                self.play_speed_frames_per_half_second = self.pause_at_end_resume_speed.max(1);
                 self.is_paused = false;
                 self.auto_paused_at_end = false;
             }
@@ -307,7 +317,7 @@ impl ReplayEngine {
         PlaybackStatus {
             frame_count: self.frame_count,
             current_frame: self.current_frame,
-            speed_fps: self.play_speed_frames_per_second,
+            speed_frames_per_half_second: self.play_speed_frames_per_half_second,
             paused: self.is_paused,
         }
     }
@@ -324,11 +334,12 @@ struct InputActions {
 struct PlaybackStatus {
     frame_count: usize,
     current_frame: usize,
-    speed_fps: i32,
+    speed_frames_per_half_second: i32,
     paused: bool,
 }
 
 struct ProgressScreenState {
+    elapsed_seconds: f64,
     state_text: String,
     window_name: String,
     exit_hint: String,
@@ -353,6 +364,7 @@ struct LogLine {
 impl ProgressScreenState {
     fn new() -> Self {
         Self {
+            elapsed_seconds: 0.0,
             state_text: String::new(),
             window_name: WINDOW_TITLE.to_string(),
             exit_hint: "Reader active. Ctrl+C to exit.".to_string(),
@@ -373,6 +385,7 @@ impl ProgressScreenState {
     }
 
     fn apply_replay_state(&mut self, replay: ReplayFrameState) {
+        self.elapsed_seconds = replay.elapsed_seconds;
         self.state_text = replay.state_text;
         self.window_name = replay.window_name;
         self.exit_hint = replay.exit_hint;
@@ -514,7 +527,7 @@ fn draw(
                 Constraint::Min(6),
                 Constraint::Length((state.worker_progress.len() as u16) + 2),
                 Constraint::Length(3),
-                Constraint::Length(3),
+                Constraint::Length(4),
             ])
             .split(area);
 
@@ -612,15 +625,19 @@ fn draw(
         } else {
             playback.current_frame.saturating_add(1)
         };
+        let replay_status_line = format!(
+            "Replay: ({}/{})",
+            current_frame_display, playback.frame_count
+        );
         let playback_hint = if playback.paused {
             format!(
-                "Frame {}/{} | speed 0 fps (paused) | Space pause | <-/-> +/-2 fps",
-                current_frame_display, playback.frame_count
+                "{}\nt={:.1}s | speed 0 frame/0.5s (paused) | Space pause | <-/-> +/-1 frame/0.5s",
+                replay_status_line, state.elapsed_seconds,
             )
         } else {
             format!(
-                "Frame {}/{} | speed {} fps | Space pause | <-/-> +/-2 fps",
-                current_frame_display, playback.frame_count, playback.speed_fps
+                "{}\nt={:.1}s | speed {} frame/0.5s | Space pause | <-/-> +/-1 frame/0.5s",
+                replay_status_line, state.elapsed_seconds, playback.speed_frames_per_half_second
             )
         };
         let footer = Paragraph::new(playback_hint.as_str())
