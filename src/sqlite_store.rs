@@ -367,9 +367,7 @@ where
             );
             match upsert_result {
                 Ok(_) => return Ok(()),
-                Err(error)
-                    if Self::is_sqlite_busy_or_locked(&error) && attempt < max_retries =>
-                {
+                Err(error) if Self::is_sqlite_busy_or_locked(&error) && attempt < max_retries => {
                     sleep(Self::busy_retry_delay(attempt, base_delay_ms));
                 }
                 Err(error) => {
@@ -567,7 +565,10 @@ where
     pub fn get_keys(&self) -> Result<Vec<K>, String> {
         let mut statement = self
             .connection
-            .prepare(&format!("SELECT id FROM {} ORDER BY id ASC", SQLITE_STORE_TABLE_NAME))
+            .prepare(&format!(
+                "SELECT id FROM {} ORDER BY id ASC",
+                SQLITE_STORE_TABLE_NAME
+            ))
             .map_err(|e| {
                 format!(
                     "Failed to query keys from table {} in {}: {}",
@@ -657,5 +658,4 @@ where
             })
             .collect()
     }
-
 }

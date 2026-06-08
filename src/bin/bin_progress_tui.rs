@@ -2,51 +2,21 @@ use std::io;
 use std::time::Duration;
 
 use clap::Parser;
-use research_utility::progress_tui_client;
-use research_utility::progress_tui_protocol::progress_screen_server_addr;
-use tokio::net::TcpStream;
+use research_utility::progress_tui_reader;
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+const DEFAULT_LOG_FILE_PATH: &str = "progress_tui_log.bin";
 
 #[derive(Debug, Parser)]
 #[command(name = "bin_progress_tui")]
-#[command(about = "Progress screen TCP client")]
+#[command(about = "Progress screen bincode log reader")]
 struct Cli {
-    #[arg(
-        short,
-        long,
-        default_value_t = progress_screen_server_addr(),
-        help = "TCP address for progress server"
-    )]
-    addr: String,
+    #[arg(short, long, default_value = DEFAULT_LOG_FILE_PATH, help = "Path to progress log file")]
+    log_file: String,
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> io::Result<()> {
     let cli = Cli::parse();
-    wait_for_server(&cli.addr).await?;
-    progress_tui_client::run_with_redraw_interval(cli.addr, REFRESH_INTERVAL).await
-}
-
-async fn wait_for_server(addr: &str) -> io::Result<()> {
-    let mut waiting_hint_printed = false;
-
-    loop {
-        match TcpStream::connect(addr).await {
-            Ok(_) => {
-                if waiting_hint_printed {
-                    eprintln!("Server is ready at {addr}. Launching UI...");
-                }
-                return Ok(());
-            }
-            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
-                if !waiting_hint_printed {
-                    eprintln!("Server not ready at {addr}. Waiting and retrying every 1s...");
-                    waiting_hint_printed = true;
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            Err(error) => return Err(error),
-        }
-    }
+    progress_tui_reader::run_with_redraw_interval(cli.log_file, REFRESH_INTERVAL).await
 }

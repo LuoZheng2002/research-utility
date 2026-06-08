@@ -512,11 +512,10 @@ where
             }
         }
 
-        self.load_table_with_indices(table_key)
-            .map(|mut rows| {
-                rows.sort_by_key(|(row_index, _)| *row_index);
-                rows.into_iter().map(|(_, value)| value).collect()
-            })
+        self.load_table_with_indices(table_key).map(|mut rows| {
+            rows.sort_by_key(|(row_index, _)| *row_index);
+            rows.into_iter().map(|(_, value)| value).collect()
+        })
     }
 
     pub fn load_table_with_indices(&self, table_key: K) -> Result<Vec<(usize, V)>, String> {
@@ -714,8 +713,7 @@ fn hex_decode(hex_str: &str) -> Result<Vec<u8>, String> {
         let high = hex_nibble(bytes[index]).ok_or_else(|| {
             format!(
                 "invalid hex character '{}' at index {}",
-                bytes[index] as char,
-                index
+                bytes[index] as char, index
             )
         })?;
         let low = hex_nibble(bytes[index + 1]).ok_or_else(|| {

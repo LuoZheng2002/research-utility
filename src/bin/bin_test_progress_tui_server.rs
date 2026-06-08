@@ -3,22 +3,21 @@ use std::time::Duration;
 
 use clap::Parser;
 use research_utility::message::{Severity, TuiMessage};
-use research_utility::progress_tui_protocol::DEFAULT_PROGRESS_SCREEN_TCP_PORT;
-use research_utility::progress_tui_server::ProgressTuiServer;
-use research_utility::progress_tui_server::{
+use research_utility::progress_tui_logger::ProgressTuiLogger;
+use research_utility::progress_tui_logger::{
     log_key_value_pair, log_master_progress, log_message, log_worker_progress,
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "bin_test_progress_tui_server")]
-#[command(about = "Generates progress events for TUI server testing")]
+#[command(name = "bin_test_progress_tui_logger")]
+#[command(about = "Generates progress events for TUI logger testing")]
 struct Cli {
     #[arg(
         long,
-        default_value_t = DEFAULT_PROGRESS_SCREEN_TCP_PORT,
-        help = "TCP port for progress TUI server"
+        default_value = "test_progress_tui_log.bin",
+        help = "Path to progress log file"
     )]
-    tui_server_port: u16,
+    log_file: String,
 }
 
 #[tokio::main]
@@ -27,10 +26,9 @@ async fn main() -> io::Result<()> {
     let num_workers = 6;
     let steps_per_worker = 40;
 
-    let log_file = Some("test.log".to_string());
-    ProgressTuiServer::initialize(cli.tui_server_port, log_file, |_command| {}).await?;
+    ProgressTuiLogger::initialize(cli.log_file).await?;
     simulate_progress(num_workers, steps_per_worker).await;
-    ProgressTuiServer::shutdown().await
+    ProgressTuiLogger::shutdown().await
 }
 
 async fn simulate_progress(num_workers: usize, steps_per_worker: usize) {

@@ -2,9 +2,8 @@ use std::io;
 use std::time::Duration;
 
 use clap::Parser;
-use research_utility::progress_tui_protocol::DEFAULT_PROGRESS_SCREEN_TCP_PORT;
-use research_utility::progress_tui_server::{
-    ProgressTuiServer, log_key_value_pair, log_worker_progress,
+use research_utility::progress_tui_logger::{
+    ProgressTuiLogger, log_key_value_pair, log_worker_progress,
 };
 
 #[derive(Debug, Parser)]
@@ -13,16 +12,16 @@ use research_utility::progress_tui_server::{
 struct Cli {
     #[arg(
         long,
-        default_value_t = DEFAULT_PROGRESS_SCREEN_TCP_PORT,
-        help = "TCP port for progress TUI server"
+        default_value = "test_progress_tui_panic_log.bin",
+        help = "Path to progress log file"
     )]
-    tui_server_port: u16,
+    log_file: String,
 }
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let cli = Cli::parse();
-    ProgressTuiServer::initialize(cli.tui_server_port, None, |_command| {}).await?;
+    ProgressTuiLogger::initialize(cli.log_file).await?;
 
     log_key_value_pair(
         "status".to_string(),
@@ -39,7 +38,7 @@ async fn main() -> io::Result<()> {
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    match ProgressTuiServer::shutdown().await {
+    match ProgressTuiLogger::shutdown().await {
         Ok(()) => {
             println!("unexpected: shutdown succeeded");
             Ok(())
