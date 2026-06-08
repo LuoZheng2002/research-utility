@@ -574,6 +574,7 @@ fn handle_input_events(state: &mut ProgressScreenState) -> io::Result<InputActio
 
                 match key_event.code {
                     KeyCode::Char(' ') => {
+                        actions.toggle_pause = true;
                         actions.refresh_file = true;
                     }
                     KeyCode::Char('p') | KeyCode::Char('P') => {
@@ -722,7 +723,7 @@ fn draw(
             vec![
                 Line::from(replay_status_line),
                 Line::from(format!(
-                    "t={:.1}s | speed 0 frame/0.5s (paused) | P pause | <-/-> +/-1 frame/0.5s | Space refresh",
+                    "t={:.1}s | speed 0 frame/0.5s (paused) | Space pause+refresh | <-/-> +/-1 frame/0.5s",
                     state.elapsed_seconds,
                 )),
             ]
@@ -730,7 +731,7 @@ fn draw(
             vec![
                 Line::from(replay_status_line),
                 Line::from(format!(
-                    "t={:.1}s | speed {} frame/0.5s | P pause | <-/-> +/-1 frame/0.5s | Space refresh",
+                    "t={:.1}s | speed {} frame/0.5s | Space pause+refresh | <-/-> +/-1 frame/0.5s",
                     state.elapsed_seconds, playback.speed_frames_per_half_second
                 )),
             ]
