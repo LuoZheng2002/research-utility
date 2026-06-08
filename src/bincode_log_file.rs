@@ -316,12 +316,9 @@ where
         let mut offset = 0_u64;
         let mut count = 0_usize;
         while offset < file_size {
+            let record_start = offset;
             if file_size - offset < LENGTH_PREFIX_BYTES {
-                return Err(format!(
-                    "Corrupted bincode log {}: trailing {} bytes smaller than length prefix",
-                    path.display(),
-                    file_size - offset
-                ));
+                break;
             }
 
             let mut len_bytes = [0_u8; LENGTH_PREFIX_BYTES as usize];
@@ -340,13 +337,8 @@ where
                 .ok_or_else(|| format!("Byte offset overflow while scanning {}", path.display()))?;
 
             if payload_len > file_size - offset {
-                return Err(format!(
-                    "Corrupted bincode log {}: payload length {} at offset {} exceeds remaining {} bytes",
-                    path.display(),
-                    payload_len,
-                    offset - LENGTH_PREFIX_BYTES,
-                    file_size - offset
-                ));
+                offset = record_start;
+                break;
             }
 
             let payload_len_i64 = i64::try_from(payload_len)
@@ -440,6 +432,8 @@ where
 mod tests {
     use super::BincodeLogFile;
     use serde::{Deserialize, Serialize};
+    use std::fs::OpenOptions;
+    use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -525,6 +519,53 @@ mod tests {
         .expect("append failed");
 
         assert_eq!(log.get(1).expect("get failed"), None);
+
+        drop(log);
+        std::fs::remove_file(&path).expect("failed to remove temporary file");
+    }
+
+    #[test]
+    fn open_ignores_incomplete_trailing_payload() {
+        let path = temp_file_path("incomplete_payload_tail");
+
+        let item = TestItem {
+            id: 1,
+            text: "ok".to_string(),
+        };
+
+        {
+            let mut log = BincodeLogFile::<TestItem>::open(&path).expect("failed to open log file");
+            log.append_and_flush(&item).expect("append failed");
+        }
+
+        {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("failed to reopen test file");
+            let partial_payload_len = 64_u64;
+            file.write_all(&partial_payload_len.to_le_bytes())
+                .expect("failed to write partial length prefix");
+            file.write_all(&[1_u8, 2, 3, 4])
+                .expect("failed to write partial payload");
+            file.flush().expect("failed to flush partial write");
+        }
+
+        let mut reopened = BincodeLogFile::<TestItem>::open(&path).expect("reopen failed");
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened.get(0).expect("get failed"), Some(item));
+
+        drop(reopened);
+        std::fs::remove_file(&path).expect("failed to remove temporary file");
+    }
+
+    #[test]
+    fn open_ignores_incomplete_trailing_length_prefix() {
+        let path = temp_file_path("incomplete_prefix_tail");
+        std::fs::write(&path, [7_u8, 8, 9]).expect("failed to seed file");
+
+        let log = BincodeLogFile::<TestItem>::open(&path).expect("open should tolerate partial tail");
+        assert_eq!(log.len(), 0);
 
         drop(log);
         std::fs::remove_file(&path).expect("failed to remove temporary file");
