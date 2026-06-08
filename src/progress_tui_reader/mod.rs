@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{
@@ -35,6 +35,7 @@ const SPEED_STEP_FRAMES_PER_HALF_SECOND: i32 = 1;
 const DEFAULT_SPEED_FRAMES_PER_HALF_SECOND: i32 = 1;
 const CACHE_CAPACITY: usize = 48;
 const CACHE_STRIDE: usize = 20;
+const REFRESH_NOTICE_DURATION: Duration = Duration::from_millis(1200);
 
 pub async fn run(log_file_path: impl Into<PathBuf>) -> io::Result<()> {
     run_with_redraw_interval(log_file_path, DEFAULT_REDRAW_INTERVAL).await
@@ -44,12 +45,23 @@ pub async fn run_with_redraw_interval(
     log_file_path: impl Into<PathBuf>,
     redraw_interval_duration: Duration,
 ) -> io::Result<()> {
+    let log_file_path = log_file_path.into();
+    if !log_file_path.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "progress log file does not exist: {}",
+                log_file_path.display()
+            ),
+        ));
+    }
+
     let _terminal_guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let mut replay = ReplayEngine::open(log_file_path.into())
+    let mut replay = ReplayEngine::open(log_file_path)
         .map_err(|e| io::Error::other(format!("failed to open replay log: {e}")))?;
     let mut screen_state = ProgressScreenState::new();
 
@@ -63,7 +75,28 @@ pub async fn run_with_redraw_interval(
                 if actions.quit {
                     break;
                 }
+                let refresh_requested = actions.refresh_file;
                 replay.apply_actions(actions);
+
+                if refresh_requested {
+                    match replay.force_refresh() {
+                        Ok(result) => {
+                            let message = if result.current_frame_count > result.previous_frame_count {
+                                format!(
+                                    "Refreshed file: {} -> {} frames",
+                                    result.previous_frame_count, result.current_frame_count
+                                )
+                            } else {
+                                format!("Refreshed file: {} frames", result.current_frame_count)
+                            };
+                            screen_state.show_refresh_notice(message, Color::Green);
+                        }
+                        Err(err) => {
+                            screen_state
+                                .show_refresh_notice(format!("Refresh failed: {err}"), Color::Red);
+                        }
+                    }
+                }
 
                 if let Some(frame_state) = replay.current_frame_state().map_err(io::Error::other)? {
                     screen_state.apply_replay_state(frame_state);
@@ -159,6 +192,11 @@ struct ReplayEngine {
     state_cache: LruCache<usize, ReplayFrameState>,
 }
 
+struct RefreshResult {
+    previous_frame_count: usize,
+    current_frame_count: usize,
+}
+
 impl ReplayEngine {
     fn open(log_path: PathBuf) -> Result<Self, String> {
         let mut log = BincodeLogFile::open(log_path)?;
@@ -247,23 +285,40 @@ impl ReplayEngine {
 
     fn refresh_if_on_last_frame(&mut self) -> Result<(), String> {
         if self.frame_count == 0 || self.current_frame + 1 >= self.frame_count {
-            let previous_len = self.frame_count;
-            self.frame_count = self.log.reload()?;
-            if self.frame_count == 0 {
-                self.current_frame = 0;
-                return Ok(());
-            }
-
-            if self.current_frame >= self.frame_count {
-                self.current_frame = self.frame_count - 1;
-            }
-
-            if self.auto_paused_at_end && self.frame_count > previous_len {
-                self.play_speed_frames_per_half_second = self.pause_at_end_resume_speed.max(1);
-                self.is_paused = false;
-                self.auto_paused_at_end = false;
-            }
+            self.reload_frames()?;
         }
+        Ok(())
+    }
+
+    fn force_refresh(&mut self) -> Result<RefreshResult, String> {
+        let previous_frame_count = self.frame_count;
+        self.reload_frames()?;
+        Ok(RefreshResult {
+            previous_frame_count,
+            current_frame_count: self.frame_count,
+        })
+    }
+
+    fn reload_frames(&mut self) -> Result<(), String> {
+        let previous_len = self.frame_count;
+        self.frame_count = self.log.reload()?;
+        self.state_cache.clear();
+
+        if self.frame_count == 0 {
+            self.current_frame = 0;
+            return Ok(());
+        }
+
+        if self.current_frame >= self.frame_count {
+            self.current_frame = self.frame_count - 1;
+        }
+
+        if self.auto_paused_at_end && self.frame_count > previous_len {
+            self.play_speed_frames_per_half_second = self.pause_at_end_resume_speed.max(1);
+            self.is_paused = false;
+            self.auto_paused_at_end = false;
+        }
+
         Ok(())
     }
 
@@ -328,6 +383,7 @@ struct InputActions {
     quit: bool,
     toggle_pause: bool,
     speed_delta_steps: i32,
+    refresh_file: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -353,6 +409,13 @@ struct ProgressScreenState {
     log_area: Rect,
     worker_progress: BTreeMap<String, ProgressGaugeState>,
     master_progress: ProgressGaugeState,
+    refresh_notice: Option<RefreshNotice>,
+}
+
+struct RefreshNotice {
+    message: String,
+    color: Color,
+    created_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -381,6 +444,7 @@ impl ProgressScreenState {
                 progress: 0.0,
                 label: "0%".to_string(),
             },
+            refresh_notice: None,
         }
     }
 
@@ -445,6 +509,28 @@ impl ProgressScreenState {
             self.log_scroll_from_bottom = max_scroll;
         }
     }
+
+    fn show_refresh_notice(&mut self, message: String, color: Color) {
+        self.refresh_notice = Some(RefreshNotice {
+            message,
+            color,
+            created_at: Instant::now(),
+        });
+    }
+
+    fn refresh_notice_line(&mut self) -> Option<Line<'static>> {
+        if let Some(notice) = &self.refresh_notice {
+            if notice.created_at.elapsed() <= REFRESH_NOTICE_DURATION {
+                return Some(Line::from(Span::styled(
+                    notice.message.clone(),
+                    Style::default().fg(notice.color),
+                )));
+            }
+        }
+
+        self.refresh_notice = None;
+        None
+    }
 }
 
 struct TerminalGuard;
@@ -488,6 +574,9 @@ fn handle_input_events(state: &mut ProgressScreenState) -> io::Result<InputActio
 
                 match key_event.code {
                     KeyCode::Char(' ') => {
+                        actions.refresh_file = true;
+                    }
+                    KeyCode::Char('p') | KeyCode::Char('P') => {
                         actions.toggle_pause = true;
                     }
                     KeyCode::Left => {
@@ -527,7 +616,7 @@ fn draw(
                 Constraint::Min(6),
                 Constraint::Length((state.worker_progress.len() as u16) + 2),
                 Constraint::Length(3),
-                Constraint::Length(4),
+                Constraint::Length(5),
             ])
             .split(area);
 
@@ -630,17 +719,27 @@ fn draw(
             current_frame_display, playback.frame_count
         );
         let playback_hint = if playback.paused {
-            format!(
-                "{}\nt={:.1}s | speed 0 frame/0.5s (paused) | Space pause | <-/-> +/-1 frame/0.5s",
-                replay_status_line, state.elapsed_seconds,
-            )
+            vec![
+                Line::from(replay_status_line),
+                Line::from(format!(
+                    "t={:.1}s | speed 0 frame/0.5s (paused) | P pause | <-/-> +/-1 frame/0.5s | Space refresh",
+                    state.elapsed_seconds,
+                )),
+            ]
         } else {
-            format!(
-                "{}\nt={:.1}s | speed {} frame/0.5s | Space pause | <-/-> +/-1 frame/0.5s",
-                replay_status_line, state.elapsed_seconds, playback.speed_frames_per_half_second
-            )
+            vec![
+                Line::from(replay_status_line),
+                Line::from(format!(
+                    "t={:.1}s | speed {} frame/0.5s | P pause | <-/-> +/-1 frame/0.5s | Space refresh",
+                    state.elapsed_seconds, playback.speed_frames_per_half_second
+                )),
+            ]
         };
-        let footer = Paragraph::new(playback_hint.as_str())
+        let mut playback_lines = playback_hint;
+        if let Some(refresh_notice_line) = state.refresh_notice_line() {
+            playback_lines.push(refresh_notice_line);
+        }
+        let footer = Paragraph::new(playback_lines)
             .block(Block::default().borders(Borders::ALL).title("Playback"));
         frame.render_widget(footer, main_layout[3]);
     })?;

@@ -12,11 +12,7 @@ use research_utility::progress_tui_logger::{
 #[command(name = "bin_test_progress_tui_logger")]
 #[command(about = "Generates progress events for TUI logger testing")]
 struct Cli {
-    #[arg(
-        long,
-        default_value = "test_progress_tui_log.bin",
-        help = "Path to progress log file"
-    )]
+    #[arg(long, help = "Path to progress log file")]
     log_file: String,
 }
 
