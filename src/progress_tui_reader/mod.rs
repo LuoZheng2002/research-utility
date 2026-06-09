@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crossterm::{
@@ -38,12 +39,20 @@ const CACHE_STRIDE: usize = 20;
 const REFRESH_NOTICE_DURATION: Duration = Duration::from_millis(1200);
 
 pub async fn run(log_file_path: impl Into<PathBuf>) -> io::Result<()> {
-    run_with_redraw_interval(log_file_path, DEFAULT_REDRAW_INTERVAL).await
+    run_with_redraw_interval_and_sync_script(log_file_path, DEFAULT_REDRAW_INTERVAL, None).await
 }
 
 pub async fn run_with_redraw_interval(
     log_file_path: impl Into<PathBuf>,
     redraw_interval_duration: Duration,
+) -> io::Result<()> {
+    run_with_redraw_interval_and_sync_script(log_file_path, redraw_interval_duration, None).await
+}
+
+pub async fn run_with_redraw_interval_and_sync_script(
+    log_file_path: impl Into<PathBuf>,
+    redraw_interval_duration: Duration,
+    sync_script_path: Option<String>,
 ) -> io::Result<()> {
     let log_file_path = log_file_path.into();
     if !log_file_path.is_file() {
@@ -79,15 +88,33 @@ pub async fn run_with_redraw_interval(
                 replay.apply_actions(actions);
 
                 if refresh_requested {
+                    let had_sync_script = sync_script_path.is_some();
+                    if let Some(script_path) = sync_script_path.as_deref() {
+                        if let Err(err) = run_sync_script(script_path) {
+                            screen_state.show_refresh_notice(
+                                format!("Sync script failed: {err}"),
+                                Color::Red,
+                            );
+                            draw(&mut terminal, &mut screen_state, replay.playback_status())?;
+                            continue;
+                        }
+                    }
                     match replay.force_refresh() {
                         Ok(result) => {
-                            let message = if result.current_frame_count > result.previous_frame_count {
+                            let verb = if had_sync_script {
+                                "Synced+refreshed"
+                            } else {
+                                "Refreshed file"
+                            };
+                            let message = if result.current_frame_count > result.previous_frame_count
+                            {
                                 format!(
-                                    "Refreshed file: {} -> {} frames",
+                                    "{}: {} -> {} frames",
+                                    verb,
                                     result.previous_frame_count, result.current_frame_count
                                 )
                             } else {
-                                format!("Refreshed file: {} frames", result.current_frame_count)
+                                format!("{}: {} frames", verb, result.current_frame_count)
                             };
                             screen_state.show_refresh_notice(message, Color::Green);
                         }
@@ -113,6 +140,28 @@ pub async fn run_with_redraw_interval(
     }
 
     Ok(())
+}
+
+fn run_sync_script(script_path: &str) -> Result<(), String> {
+    let output = Command::new("bash")
+        .arg(script_path)
+        .output()
+        .map_err(|err| format!("failed to execute script '{}': {}", script_path, err))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        return Err(format!(
+            "script '{}' exited with status {}",
+            script_path, output.status
+        ));
+    }
+    Err(format!(
+        "script '{}' exited with status {}: {}",
+        script_path, output.status, stderr
+    ))
 }
 
 #[derive(Debug, Clone)]
