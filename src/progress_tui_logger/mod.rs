@@ -274,6 +274,10 @@ pub fn log_message(message: TuiMessage) {
             message: message.clone(),
             severity: *severity,
         });
+        // print out info and error messages to stdout
+        if *severity == Severity::Info || *severity == Severity::Error {
+            println!("{}", message);
+        }
     }
     state.snapshot.lock().apply_message(&message);
 }
