@@ -12,6 +12,7 @@ use crate::bincode_log_file::BincodeLogFile;
 use crate::message::{Severity, TuiMessage};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(500);
+const SYNC_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProgressGaugeState {
@@ -192,6 +193,8 @@ struct ProgressTuiLoggerState {
     pending_log_lines: parking_lot::Mutex<Vec<ProgressLogLine>>,
     log_file: parking_lot::Mutex<BincodeLogFile<ProgressLogFrame>>,
     last_flushed_snapshot: parking_lot::Mutex<ProgressSnapshot>,
+    last_sync_instant: parking_lot::Mutex<Instant>,
+    has_unsynced_writes: parking_lot::Mutex<bool>,
     shutdown_tx: parking_lot::Mutex<Option<oneshot::Sender<()>>>,
     join_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<io::Result<()>>>>,
 }
@@ -220,12 +223,15 @@ impl ProgressTuiLogger {
         let log_file = BincodeLogFile::open(log_file_path)
             .map_err(|e| io::Error::other(format!("failed to open progress log file: {e}")))?;
 
+        let start_instant = Instant::now();
         let state = Arc::new(ProgressTuiLoggerState {
-            start_instant: Instant::now(),
+            start_instant,
             snapshot: parking_lot::Mutex::new(ProgressSnapshot::default()),
             pending_log_lines: parking_lot::Mutex::new(Vec::new()),
             log_file: parking_lot::Mutex::new(log_file),
             last_flushed_snapshot: parking_lot::Mutex::new(ProgressSnapshot::default()),
+            last_sync_instant: parking_lot::Mutex::new(start_instant),
+            has_unsynced_writes: parking_lot::Mutex::new(false),
             shutdown_tx: parking_lot::Mutex::new(None),
             join_handle: parking_lot::Mutex::new(None),
         });
@@ -359,10 +365,10 @@ async fn run_flush_loop(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                flush_frame_if_needed(&state)?;
+                flush_frame_if_needed(&state, false)?;
             }
             _ = &mut shutdown_rx => {
-                flush_frame_if_needed(&state)?;
+                flush_frame_if_needed(&state, true)?;
                 break;
             }
         }
@@ -371,7 +377,7 @@ async fn run_flush_loop(
     Ok(())
 }
 
-fn flush_frame_if_needed(state: &Arc<ProgressTuiLoggerState>) -> io::Result<()> {
+fn flush_frame_if_needed(state: &Arc<ProgressTuiLoggerState>, force_sync: bool) -> io::Result<()> {
     let snapshot = state.snapshot.lock().clone();
     let log_lines = {
         let mut guard = state.pending_log_lines.lock();
@@ -381,16 +387,46 @@ fn flush_frame_if_needed(state: &Arc<ProgressTuiLoggerState>) -> io::Result<()> 
     let mut frame = snapshot.delta_from(&previous, log_lines);
     frame.elapsed_seconds = state.start_instant.elapsed().as_secs_f64();
 
-    if frame.is_empty() {
+    let has_frame = !frame.is_empty();
+    let sync_due = {
+        let last_sync_instant = *state.last_sync_instant.lock();
+        force_sync || last_sync_instant.elapsed() >= SYNC_INTERVAL
+    };
+    let has_unsynced_writes = *state.has_unsynced_writes.lock();
+
+    if !has_frame && !(sync_due && has_unsynced_writes) {
         return Ok(());
     }
 
+    let mut synced = false;
     {
         let mut log_file = state.log_file.lock();
-        log_file
-            .append_and_flush(&frame)
-            .map_err(|e| io::Error::other(format!("failed to append log frame: {e}")))?;
+        if has_frame {
+            if sync_due {
+                log_file.append_and_sync(&frame).map_err(|e| {
+                    io::Error::other(format!("failed to append and sync log frame: {e}"))
+                })?;
+                synced = true;
+            } else {
+                log_file
+                    .append_and_flush(&frame)
+                    .map_err(|e| io::Error::other(format!("failed to append log frame: {e}")))?;
+            }
+        } else {
+            log_file
+                .sync_data()
+                .map_err(|e| io::Error::other(format!("failed to sync progress log file: {e}")))?;
+            synced = true;
+        }
     }
-    *state.last_flushed_snapshot.lock() = snapshot;
+
+    if has_frame {
+        *state.last_flushed_snapshot.lock() = snapshot;
+        *state.has_unsynced_writes.lock() = !synced;
+    }
+    if synced {
+        *state.last_sync_instant.lock() = Instant::now();
+        *state.has_unsynced_writes.lock() = false;
+    }
     Ok(())
 }

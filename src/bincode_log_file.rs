@@ -142,6 +142,17 @@ where
             .map_err(|e| format!("Failed to flush {}: {}", self.path.display(), e))
     }
 
+    pub fn append_and_sync(&mut self, item: &T) -> Result<(), String> {
+        self.append_and_flush(item)?;
+        self.sync_data()
+    }
+
+    pub fn sync_data(&self) -> Result<(), String> {
+        self.file
+            .sync_data()
+            .map_err(|e| format!("Failed to sync {}: {}", self.path.display(), e))
+    }
+
     pub fn get(&mut self, index: usize) -> Result<Option<T>, String> {
         if index >= self.len {
             return Ok(None);
@@ -623,7 +634,8 @@ mod tests {
         let path = temp_file_path("incomplete_prefix_tail");
         std::fs::write(&path, [7_u8, 8, 9]).expect("failed to seed file");
 
-        let log = BincodeLogFile::<TestItem>::open(&path).expect("open should tolerate partial tail");
+        let log =
+            BincodeLogFile::<TestItem>::open(&path).expect("open should tolerate partial tail");
         assert_eq!(log.len(), 0);
 
         drop(log);
@@ -647,14 +659,17 @@ mod tests {
                 .truncate(true)
                 .open(&path)
                 .expect("failed to create test file");
-            file.write_all(&(u64::try_from(truncated_len).expect("len conversion failed")).to_le_bytes())
-                .expect("failed to write length");
+            file.write_all(
+                &(u64::try_from(truncated_len).expect("len conversion failed")).to_le_bytes(),
+            )
+            .expect("failed to write length");
             file.write_all(&payload[..truncated_len])
                 .expect("failed to write truncated payload");
             file.flush().expect("failed to flush file");
         }
 
-        let log = BincodeLogFile::<TestItem>::open(&path).expect("open should tolerate truncated tail item");
+        let log = BincodeLogFile::<TestItem>::open(&path)
+            .expect("open should tolerate truncated tail item");
         assert_eq!(log.len(), 0);
 
         drop(log);
@@ -683,12 +698,17 @@ mod tests {
                 .truncate(true)
                 .open(&path)
                 .expect("failed to create test file");
-            file.write_all(&(u64::try_from(bad_len).expect("bad len conversion failed")).to_le_bytes())
-                .expect("failed to write bad length");
+            file.write_all(
+                &(u64::try_from(bad_len).expect("bad len conversion failed")).to_le_bytes(),
+            )
+            .expect("failed to write bad length");
             file.write_all(&bad_payload[..bad_len])
                 .expect("failed to write bad payload");
-            file.write_all(&(u64::try_from(good_payload.len()).expect("good len conversion failed")).to_le_bytes())
-                .expect("failed to write good length");
+            file.write_all(
+                &(u64::try_from(good_payload.len()).expect("good len conversion failed"))
+                    .to_le_bytes(),
+            )
+            .expect("failed to write good length");
             file.write_all(&good_payload)
                 .expect("failed to write good payload");
             file.flush().expect("failed to flush file");
