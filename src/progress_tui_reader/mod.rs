@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use arboard::Clipboard;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -468,6 +469,7 @@ struct ProgressScreenState {
     worker_progress: BTreeMap<String, ProgressGaugeState>,
     master_progress: ProgressGaugeState,
     refresh_notice: Option<RefreshNotice>,
+    clipboard: Option<Clipboard>,
 }
 
 struct RefreshNotice {
@@ -503,6 +505,7 @@ impl ProgressScreenState {
                 label: "0%".to_string(),
             },
             refresh_notice: None,
+            clipboard: None,
         }
     }
 
@@ -634,6 +637,16 @@ fn handle_input_events(state: &mut ProgressScreenState) -> io::Result<InputActio
                     KeyCode::Char(' ') => {
                         actions.toggle_pause = true;
                         actions.refresh_file = true;
+                    }
+                    KeyCode::Char('c') => {
+                        if let Err(err) = copy_log_window_contents(state) {
+                            state.show_refresh_notice(format!("Copy failed: {err}"), Color::Red);
+                        } else {
+                            state.show_refresh_notice(
+                                "Copied log window contents to clipboard".to_string(),
+                                Color::Green,
+                            );
+                        }
                     }
                     KeyCode::Char('p') | KeyCode::Char('P') => {
                         actions.toggle_pause = true;
@@ -781,7 +794,7 @@ fn draw(
             vec![
                 Line::from(replay_status_line),
                 Line::from(format!(
-                    "t={:.1}s | speed 0 frame/0.5s (paused) | Space pause+refresh | <-/-> +/-1 frame/0.5s",
+                    "t={:.1}s | speed 0 frame/0.5s (paused) | Space pause+refresh | c copy logs | <-/-> +/-1 frame/0.5s",
                     state.elapsed_seconds,
                 )),
             ]
@@ -789,7 +802,7 @@ fn draw(
             vec![
                 Line::from(replay_status_line),
                 Line::from(format!(
-                    "t={:.1}s | speed {} frame/0.5s | Space pause+refresh | <-/-> +/-1 frame/0.5s",
+                    "t={:.1}s | speed {} frame/0.5s | Space pause+refresh | c copy logs | <-/-> +/-1 frame/0.5s",
                     state.elapsed_seconds, playback.speed_frames_per_half_second
                 )),
             ]
@@ -848,6 +861,33 @@ fn rendered_log_lines(log_lines: &VecDeque<LogLine>) -> Vec<Line<'static>> {
             Line::from(Span::styled(line.message.clone(), style))
         })
         .collect()
+}
+
+fn copy_log_window_contents(state: &mut ProgressScreenState) -> Result<(), String> {
+    let text = if state.log_lines.is_empty() {
+        "No logs yet".to_string()
+    } else {
+        state
+            .log_lines
+            .iter()
+            .map(|line| line.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    if state.clipboard.is_none() {
+        state.clipboard =
+            Some(Clipboard::new().map_err(|err| format!("unable to access clipboard: {err}"))?);
+    }
+
+    let clipboard = state
+        .clipboard
+        .as_mut()
+        .ok_or_else(|| "clipboard is unavailable".to_string())?;
+    clipboard
+        .set_text(text)
+        .map_err(|err| format!("unable to set clipboard contents: {err}"))?;
+    Ok(())
 }
 
 fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
