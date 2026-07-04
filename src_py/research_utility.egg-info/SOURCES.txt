@@ -5,6 +5,7 @@ src_py/research_utility/sqlite_store.py
 src_py/research_utility/sqlite_table_array_store.py
 src_py/research_utility/sqlite_to_jsonl.py
 src_py/research_utility/sqlite_to_jsonl_all.py
+src_py/research_utility/tui_message.py
 src_py/research_utility.egg-info/PKG-INFO
 src_py/research_utility.egg-info/SOURCES.txt
 src_py/research_utility.egg-info/dependency_links.txt
