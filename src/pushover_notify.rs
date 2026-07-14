@@ -9,9 +9,7 @@
 //! - `PUSHOVER_TOKEN` — Application API token (create at <https://pushover.net/apps/build>)
 //! - `PUSHOVER_USER`  — Your user key (find at <https://pushover.net>)
 
-use std::collections::HashMap;
 use std::env;
-use std::io::Read;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -144,16 +142,21 @@ pub fn push_notification_with(
         vec![("token", &token), ("user", &user), ("message", message)];
 
     // Helper to push optional string params
-    let mut push_if = |key: &'static str, val: &str| {
-        if !val.is_empty() {
-            params.push((key, val));
-        }
-    };
-    push_if("title", options.title);
-    push_if("device", options.device);
-    push_if("sound", options.sound);
-    push_if("url", options.url);
-    push_if("url_title", options.url_title);
+    if !options.title.is_empty() {
+        params.push(("title", options.title));
+    }
+    if !options.device.is_empty() {
+        params.push(("device", options.device));
+    }
+    if !options.sound.is_empty() {
+        params.push(("sound", options.sound));
+    }
+    if !options.url.is_empty() {
+        params.push(("url", options.url));
+    }
+    if !options.url_title.is_empty() {
+        params.push(("url_title", options.url_title));
+    }
 
     let priority_str;
     if options.priority != 0 {
