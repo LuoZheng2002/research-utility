@@ -3,8 +3,6 @@ pub mod bincode_log_file;
 pub mod launch_python_process;
 pub mod message;
 pub mod progress_text_logger;
-pub mod progress_tui_logger;
-pub mod progress_tui_reader;
 pub mod pushover_notify;
 pub mod sqlite_store;
 pub mod sqlite_table_array_store;

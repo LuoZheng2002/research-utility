@@ -17,7 +17,7 @@ from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel
 
-from research_utility.tui_message import UnixTuiForwarder
+from research_utility.text_message import UnixTextForwarder
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -67,10 +67,10 @@ class RustParentConnection(Generic[T]):
         *,
         stdin_model: type[T] | None = None,
     ) -> None:
-        self._forwarder: UnixTuiForwarder | None = None
+        self._forwarder: UnixTextForwarder | None = None
         socket_path = (orchestrator_socket_path or "").strip()
         if socket_path:
-            self._forwarder = UnixTuiForwarder(socket_path)
+            self._forwarder = UnixTextForwarder(socket_path)
 
         self._stdin_data: T | None = None
         if stdin_model is not None:
@@ -93,35 +93,40 @@ class RustParentConnection(Generic[T]):
         """Return ``True`` when a stdin payload was read and parsed."""
         return self._stdin_data is not None
 
-    # -- TUI message helpers --------------------------------------------------
+    # -- text message helpers --------------------------------------------------
 
     def send_info(self, message: str) -> None:
-        """Send an informational log line to the Rust TUI."""
+        """Send an informational log line to the Rust orchestrator."""
         if self._forwarder is not None:
             self._forwarder.send_info(message)
 
+    def send_verbose(self, message: str) -> None:
+        """Send a verbose log line to the Rust orchestrator."""
+        if self._forwarder is not None:
+            self._forwarder.send_verbose(message)
+
     def send_warning(self, message: str) -> None:
-        """Send a warning log line to the Rust TUI."""
+        """Send a warning log line to the Rust orchestrator."""
         if self._forwarder is not None:
             self._forwarder.send_warning(message)
 
     def send_error(self, message: str) -> None:
-        """Send an error log line to the Rust TUI."""
+        """Send an error log line to the Rust orchestrator."""
         if self._forwarder is not None:
             self._forwarder.send_error(message)
 
     def send_state(self, state: str) -> None:
-        """Update the state label shown in the Rust TUI."""
+        """Update the state label shown in the Rust orchestrator."""
         if self._forwarder is not None:
             self._forwarder.send_state(state)
 
     def send_key_value(self, key: str, value: str) -> None:
-        """Emit a key-value pair to the Rust TUI."""
+        """Emit a key-value pair to the Rust orchestrator."""
         if self._forwarder is not None:
             self._forwarder.send_key_value_pair(key, value)
 
     def send_raw_message(self, payload: dict[str, Any]) -> None:
-        """Send an arbitrary TUI message dictionary (e.g. from a subprocess
+        """Send an arbitrary text message dictionary (e.g. from a subprocess
         stdout line)."""
         if self._forwarder is not None:
             self._forwarder.send_message(payload)
@@ -129,12 +134,12 @@ class RustParentConnection(Generic[T]):
     # -- lifecycle ------------------------------------------------------------
 
     def close(self) -> None:
-        """Close the TUI socket connection (best-effort)."""
+        """Close the socket connection (best-effort)."""
         if self._forwarder is not None:
             self._forwarder.close()
             self._forwarder = None
 
     @property
     def is_connected(self) -> bool:
-        """Return ``True`` when the TUI socket is open."""
+        """Return ``True`` when the socket is open."""
         return self._forwarder is not None

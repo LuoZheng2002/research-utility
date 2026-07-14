@@ -12,7 +12,7 @@ use tokio::sync::watch;
 
 use crate::{
     message::TuiMessage,
-    progress_tui_logger::{log_message, log_warning},
+    progress_text_logger::{log_message, log_warning},
 };
 
 // ---------------------------------------------------------------------------

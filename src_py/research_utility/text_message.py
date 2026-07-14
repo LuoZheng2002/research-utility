@@ -16,6 +16,10 @@ def info_line_message(message: str) -> dict[str, Any]:
     return line_message(message, "Info")
 
 
+def verbose_line_message(message: str) -> dict[str, Any]:
+    return line_message(message, "Verbose")
+
+
 def warning_line_message(message: str) -> dict[str, Any]:
     return line_message(message, "Warning")
 
@@ -60,11 +64,11 @@ def exit_hint_message(hint: str) -> dict[str, Any]:
     return {"ExitHint": str(hint)}
 
 
-def serialize_tui_message(message: dict[str, Any]) -> str:
+def serialize_text_message(message: dict[str, Any]) -> str:
     return json.dumps(message, ensure_ascii=True, separators=(",", ":"))
 
 
-class UnixTuiForwarder:
+class UnixTextForwarder:
     def __init__(self, socket_path: str | None) -> None:
         self._socket_path = (socket_path or "").strip()
         self._socket: socket.socket | None = None
@@ -83,7 +87,7 @@ class UnixTuiForwarder:
             except Exception:
                 pass
             print(
-                f"[TUI_SOCKET] failed to connect to orchestrator socket {self._socket_path}: {error}",
+                f"[TEXT_SOCKET] failed to connect to orchestrator socket {self._socket_path}: {error}",
                 flush=True,
             )
 
@@ -99,7 +103,7 @@ class UnixTuiForwarder:
             pass
 
     def send_message(self, message: dict[str, Any]) -> None:
-        payload = serialize_tui_message(message).encode("utf-8") + b"\n"
+        payload = serialize_text_message(message).encode("utf-8") + b"\n"
         with self._lock:
             if self._socket is None:
                 return
@@ -107,7 +111,7 @@ class UnixTuiForwarder:
                 self._socket.sendall(payload)
             except Exception as error:  # noqa: BLE001
                 print(
-                    f"[TUI_SOCKET] failed to send TuiMessage to {self._socket_path}: {error}",
+                    f"[TEXT_SOCKET] failed to send message to {self._socket_path}: {error}",
                     flush=True,
                 )
                 try:
@@ -121,6 +125,9 @@ class UnixTuiForwarder:
 
     def send_info(self, message: str) -> None:
         self.send_message(info_line_message(message))
+
+    def send_verbose(self, message: str) -> None:
+        self.send_message(verbose_line_message(message))
 
     def send_warning(self, message: str) -> None:
         self.send_message(warning_line_message(message))
@@ -150,7 +157,7 @@ class UnixTuiForwarder:
 
 
 __all__ = [
-    "UnixTuiForwarder",
+    "UnixTextForwarder",
     "delete_worker_bar_message",
     "error_line_message",
     "exit_hint_message",
@@ -158,8 +165,9 @@ __all__ = [
     "key_value_pair_message",
     "line_message",
     "master_progress_message",
-    "serialize_tui_message",
+    "serialize_text_message",
     "state_message",
+    "verbose_line_message",
     "warning_line_message",
     "window_name_message",
     "worker_progress_message",

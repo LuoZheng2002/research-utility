@@ -7,6 +7,7 @@ pub enum Severity {
     Info,
     Warning,
     Error,
+    Verbose,
 }
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum TuiMessage {
@@ -46,6 +47,7 @@ impl TuiMessage {
                 Severity::Info => format!("INFO: {message}"),
                 Severity::Warning => format!("WARNING: {message}"),
                 Severity::Error => format!("ERROR: {message}"),
+                Severity::Verbose => format!("VERBOSE: {message}"),
             },
             TuiMessage::State { state } => format!("STATE: {state}"),
             TuiMessage::WindowName { window_name } => format!("WINDOW NAME: {window_name}"),

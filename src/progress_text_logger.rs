@@ -6,12 +6,24 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
+use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::message::{Severity, TuiMessage};
-use crate::progress_tui_logger::{ProgressGaugeState, ProgressLogLine};
 
 const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProgressGaugeState {
+    pub progress: f32,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgressLogLine {
+    pub message: String,
+    pub severity: Severity,
+}
 
 #[derive(Debug, Clone)]
 struct TextSnapshot {
@@ -136,22 +148,18 @@ impl ProgressTextLogger {
             }
         }
 
-        let summary_file = BufWriter::new(
-            File::create(&summary_path).map_err(|e| {
-                io::Error::other(format!(
-                    "failed to create summary log file {}: {e}",
-                    summary_path.display()
-                ))
-            })?,
-        );
-        let verbose_file = BufWriter::new(
-            File::create(&verbose_path).map_err(|e| {
-                io::Error::other(format!(
-                    "failed to create verbose log file {}: {e}",
-                    verbose_path.display()
-                ))
-            })?,
-        );
+        let summary_file = BufWriter::new(File::create(&summary_path).map_err(|e| {
+            io::Error::other(format!(
+                "failed to create summary log file {}: {e}",
+                summary_path.display()
+            ))
+        })?);
+        let verbose_file = BufWriter::new(File::create(&verbose_path).map_err(|e| {
+            io::Error::other(format!(
+                "failed to create verbose log file {}: {e}",
+                verbose_path.display()
+            ))
+        })?);
 
         let start_instant = Instant::now();
         let state = Arc::new(ProgressTextLoggerState {
@@ -211,15 +219,11 @@ pub fn log_message(message: TuiMessage) {
                 severity: *severity,
             });
 
-            // Immediately write Info messages to the summary file.
-            if *severity == Severity::Info {
+            // Info and Error messages go to both the summary and verbose files.
+            if *severity == Severity::Info || *severity == Severity::Error {
                 if let Err(err) = writeln!(state.summary_file.lock(), "{message}") {
                     eprintln!("failed to write to summary log: {err}");
                 }
-            }
-
-            // Print Info and Error messages to stdout.
-            if *severity == Severity::Info || *severity == Severity::Error {
                 println!("{message}");
             }
         }
@@ -236,16 +240,23 @@ pub fn log_info(message: impl Into<String>) {
     });
 }
 
-pub fn log_warning(message: impl Into<String>) {
+pub fn log_verbose(message: impl Into<String>) {
     log_message(TuiMessage::Line {
         message: message.into(),
+        severity: Severity::Verbose,
+    });
+}
+
+pub fn log_warning(message: impl Into<String>) {
+    log_message(TuiMessage::Line {
+        message: format!("[WARNING] {}", message.into()),
         severity: Severity::Warning,
     });
 }
 
 pub fn log_error(message: impl Into<String>) {
     log_message(TuiMessage::Line {
-        message: message.into(),
+        message: format!("[ERROR] {}", message.into()),
         severity: Severity::Error,
     });
 }
@@ -385,6 +396,7 @@ fn flush_verbose_section(state: &ProgressTextLoggerState) -> io::Result<()> {
                 Severity::Info => "INFO",
                 Severity::Warning => "WARN",
                 Severity::Error => "ERROR",
+                Severity::Verbose => "VERBOSE",
             };
             writeln!(file, "  [{}] {}", severity_str, line.message)?;
         }
