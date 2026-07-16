@@ -221,10 +221,41 @@ pub fn log_message(message: TuiMessage) {
 
             // Info and Error messages go to both the summary and verbose files.
             if *severity == Severity::Info || *severity == Severity::Error {
-                if let Err(err) = writeln!(state.summary_file.lock(), "{message}") {
+                let mut summary_file = state.summary_file.lock();
+                if let Err(err) = writeln!(summary_file, "{message}") {
                     eprintln!("failed to write to summary log: {err}");
                 }
+                if let Err(err) = summary_file.flush() {
+                    eprintln!("failed to flush summary log: {err}");
+                }
                 println!("{message}");
+            }
+        }
+        TuiMessage::WindowName { window_name } => {
+            let mut summary_file = state.summary_file.lock();
+            if let Err(err) = writeln!(summary_file, "window_name\t{window_name}") {
+                eprintln!("failed to write window_name to summary log: {err}");
+            }
+            if let Err(err) = summary_file.flush() {
+                eprintln!("failed to flush summary log: {err}");
+            }
+        }
+        TuiMessage::State { state: state_value } => {
+            let mut summary_file = state.summary_file.lock();
+            if let Err(err) = writeln!(summary_file, "state\t{state_value}") {
+                eprintln!("failed to write state to summary log: {err}");
+            }
+            if let Err(err) = summary_file.flush() {
+                eprintln!("failed to flush summary log: {err}");
+            }
+        }
+        TuiMessage::KeyValuePair { key, value } => {
+            let mut summary_file = state.summary_file.lock();
+            if let Err(err) = writeln!(summary_file, "{key}\t{value}") {
+                eprintln!("failed to write key-value pair to summary log: {err}");
+            }
+            if let Err(err) = summary_file.flush() {
+                eprintln!("failed to flush summary log: {err}");
             }
         }
         _ => {}
