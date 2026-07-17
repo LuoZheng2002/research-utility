@@ -13,7 +13,7 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-SLURM_ACCOUNT = "bfdz-delta-gpu"
+SLURM_ACCOUNT = "bfsl-delta-gpu"
 
 
 def _hours_to_slurm_time(total_hours: float) -> str:
@@ -135,7 +135,8 @@ def submit(spec: SlurmJobSpec) -> int:
     print(f"  Time limit:   {slurm_time} (raw: {total_time_limit_hours}h + 10% buffer)")
     print(f"  Slurm script: {slurm_script}")
 
-    notify_msg = f"{spec.job_prefix}{model_cli_name}_{config_nickname} finished running."
+    notify_start_msg = f"{spec.job_prefix}{model_cli_name}_{config_nickname} started running."
+    notify_end_msg = f"{spec.job_prefix}{model_cli_name}_{config_nickname} finished running."
 
     cmd = [
         "sbatch",
@@ -147,7 +148,8 @@ def submit(spec: SlurmJobSpec) -> int:
         "--time", slurm_time,
         str(slurm_script),
         str(config_path),
-        notify_msg,
+        notify_start_msg,
+        notify_end_msg,
     ]
 
     result = subprocess.run(cmd, cwd=str(root), check=False)
