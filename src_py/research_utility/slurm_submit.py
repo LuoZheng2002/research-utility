@@ -79,6 +79,15 @@ class SlurmJobSpec:
     repo_root: Path
     """Absolute path to the credit_assignment repository root."""
 
+    request_gpu: bool = True
+    """Whether to request A100 GPUs from SLURM."""
+
+    partition: str | None = None
+    """Optional partition to pass explicitly to sbatch."""
+
+    account: str = SLURM_ACCOUNT
+    """SLURM account to charge."""
+
 
 def submit(spec: SlurmJobSpec) -> int:
     """Parse CLI args, validate the TOML config, and submit a SLURM job.
@@ -112,7 +121,7 @@ def submit(spec: SlurmJobSpec) -> int:
     config = _parse_toml(config_path)
     model_cli_name = _require_str(config, "model_cli_name")
     config_nickname = _require_str(config, spec.nickname_key)
-    num_gpus = _require_positive_int(config, "num_gpus")
+    num_gpus = _require_positive_int(config, "num_gpus") if spec.request_gpu else 0
     total_time_limit_hours = _require_positive_number(config, "total_time_limit_hours")
     slurm_time = _hours_to_slurm_time(total_time_limit_hours)
 
@@ -131,7 +140,9 @@ def submit(spec: SlurmJobSpec) -> int:
     print("Submitting SLURM job:")
     print(f"  Config:       {config_path}")
     print(f"  Job name:     {job_name}")
-    print(f"  GPUs:         {num_gpus}")
+    print(f"  GPUs:         {num_gpus if spec.request_gpu else 'none'}")
+    if spec.partition is not None:
+        print(f"  Partition:    {spec.partition}")
     print(f"  Time limit:   {slurm_time} (raw: {total_time_limit_hours}h + 10% buffer)")
     print(f"  Slurm script: {slurm_script}")
 
@@ -141,16 +152,22 @@ def submit(spec: SlurmJobSpec) -> int:
     cmd = [
         "sbatch",
         "--job-name", job_name,
-        "--account", SLURM_ACCOUNT,
+        "--account", spec.account,
         "--output", f"slurm/logs/{log_prefix}_%j.out",
         "--error", f"slurm/logs/{log_prefix}_%j.err",
-        "--gres", f"gpu:nvidia_a100:{num_gpus}",
         "--time", slurm_time,
         str(slurm_script),
         str(config_path),
         notify_start_msg,
         notify_end_msg,
     ]
+    if spec.partition is not None:
+        cmd[cmd.index("--time"):cmd.index("--time")] = ["--partition", spec.partition]
+    if spec.request_gpu:
+        cmd[cmd.index("--time"):cmd.index("--time")] = [
+            "--gres",
+            f"gpu:nvidia_a100:{num_gpus}",
+        ]
 
     result = subprocess.run(cmd, cwd=str(root), check=False)
     return result.returncode
