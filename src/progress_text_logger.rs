@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
+use chrono::Local;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
@@ -23,6 +24,7 @@ pub struct ProgressGaugeState {
 pub struct ProgressLogLine {
     pub message: String,
     pub severity: Severity,
+    pub timestamp: String,
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +130,14 @@ static PROGRESS_TEXT_LOGGER_STATE: ArcSwapOption<ProgressTextLoggerState> =
 
 pub struct ProgressTextLogger;
 
+fn current_log_timestamp() -> String {
+    Local::now().format("%Y-%m-%d %H:%M:%S%.3f %:z").to_string()
+}
+
+fn timestamped_line(timestamp: &str, message: &str) -> String {
+    format!("[{timestamp}] {message}")
+}
+
 impl ProgressTextLogger {
     pub async fn initialize(
         summary_path: impl Into<PathBuf>,
@@ -207,8 +217,9 @@ impl ProgressTextLogger {
 }
 
 pub fn log_message(message: TuiMessage) {
+    let timestamp = current_log_timestamp();
     let Some(state) = PROGRESS_TEXT_LOGGER_STATE.load_full() else {
-        println!("{}", message.to_string());
+        println!("{}", timestamped_line(&timestamp, &message.to_string()));
         return;
     };
 
@@ -217,18 +228,20 @@ pub fn log_message(message: TuiMessage) {
             state.pending_log_lines.lock().push(ProgressLogLine {
                 message: message.clone(),
                 severity: *severity,
+                timestamp: timestamp.clone(),
             });
 
             // Info and Error messages go to both the summary and verbose files.
             if *severity == Severity::Info || *severity == Severity::Error {
+                let line = timestamped_line(&timestamp, message);
                 let mut summary_file = state.summary_file.lock();
-                if let Err(err) = writeln!(summary_file, "{message}") {
+                if let Err(err) = writeln!(summary_file, "{line}") {
                     eprintln!("failed to write to summary log: {err}");
                 }
                 if let Err(err) = summary_file.flush() {
                     eprintln!("failed to flush summary log: {err}");
                 }
-                println!("{message}");
+                println!("{line}");
             }
         }
         _ => {}
@@ -402,7 +415,11 @@ fn flush_verbose_section(state: &ProgressTextLoggerState) -> io::Result<()> {
                 Severity::Error => "ERROR",
                 Severity::Verbose => "VERBOSE",
             };
-            writeln!(file, "  [{}] {}", severity_str, line.message)?;
+            writeln!(
+                file,
+                "  [{}] [{}] {}",
+                line.timestamp, severity_str, line.message
+            )?;
         }
     }
 

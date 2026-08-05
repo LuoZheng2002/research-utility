@@ -105,6 +105,11 @@ def submit(spec: SlurmJobSpec) -> int:
         default=None,
         help=f"SLURM job name (default: {spec.job_prefix}<model>_<nickname>)",
     )
+    parser.add_argument(
+        "--dependency",
+        default=None,
+        help="Optional SLURM dependency expression, e.g. afterok:12345",
+    )
     args = parser.parse_args()
 
     root = spec.repo_root
@@ -144,6 +149,8 @@ def submit(spec: SlurmJobSpec) -> int:
     if spec.partition is not None:
         print(f"  Partition:    {spec.partition}")
     print(f"  Time limit:   {slurm_time} (raw: {total_time_limit_hours}h + 10% buffer)")
+    if args.dependency:
+        print(f"  Dependency:   {args.dependency}")
     print(f"  Slurm script: {slurm_script}")
 
     notify_start_msg = f"{spec.job_prefix}{model_cli_name}_{config_nickname} started running."
@@ -161,6 +168,8 @@ def submit(spec: SlurmJobSpec) -> int:
         notify_start_msg,
         notify_end_msg,
     ]
+    if args.dependency:
+        cmd[cmd.index("--time"):cmd.index("--time")] = ["--dependency", args.dependency]
     if spec.partition is not None:
         cmd[cmd.index("--time"):cmd.index("--time")] = ["--partition", spec.partition]
     if spec.request_gpu:
